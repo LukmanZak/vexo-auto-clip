@@ -1,0 +1,2 @@
+# Word-timestamp captions for Context Slicer
+faster-whisper>=1.2,<2

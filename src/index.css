@@ -1,0 +1,97 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-headline: "Outfit", sans-serif;
+  --font-sans: "Space Grotesk", sans-serif;
+
+  --color-background: #020617;
+  --color-surface: #0f172a;
+  --color-surface-container-lowest: #020617;
+  --color-surface-container-low: #1e293b;
+  --color-surface-container: #334155;
+  --color-surface-container-high: #475569;
+  --color-surface-container-highest: #64748b;
+  
+  --color-primary: #3b82f6;
+  --color-primary-container: color-mix(in srgb, var(--color-primary), black 60%);
+  --color-on-primary: #ffffff;
+  
+  --color-secondary: #22d3ee;
+  --color-secondary-container: color-mix(in srgb, var(--color-secondary), black 80%);
+  
+  --color-tertiary: #a855f7; /* Purple 500 */
+  --color-highlight: #facc15;
+  --color-on-surface-variant: #94a3b8;
+  --color-outline-variant: #334155;
+
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-pulse-slow: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-20px); }
+}
+
+@layer base {
+  body {
+    @apply bg-background text-white font-sans antialiased selection:bg-primary/30 selection:text-white;
+  }
+
+  /* Global Minimalist Scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 20px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    transition: background 0.3s;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(59, 130, 246, 0.3); /* Using hex of primary for hover */
+    background-clip: padding-box;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.05) transparent;
+  }
+}
+
+.glass-card {
+  @apply bg-white/5 backdrop-blur-2xl border border-white/10 rounded-[2.5rem] shadow-2xl;
+}
+
+.neo-glow {
+  box-shadow: 0 0 40px -10px var(--color-primary);
+}
+
+.text-gradient {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-primary via-tertiary to-secondary;
+}
+
+.btn-primary {
+  @apply relative overflow-hidden bg-primary text-white font-bold py-4 px-8 rounded-2xl transition-all hover:scale-105 active:scale-95 hover:shadow-[0_0_30px_-5px_rgba(244,114,182,0.6)];
+}
+
+.btn-secondary {
+  @apply bg-white/5 border border-white/10 text-white font-semibold py-4 px-8 rounded-2xl transition-all hover:bg-white/10 hover:border-white/20;
+}
+.text-highlight {
+  @apply text-highlight;
+}
+
+.highlight-gradient {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-highlight to-orange-400;
+}
+

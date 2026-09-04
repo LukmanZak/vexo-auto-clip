@@ -1,0 +1,23 @@
+# Dependencies and build artifacts
+node_modules/
+dist/
+
+# Runtime inputs and generated media
+/temp/
+
+# Generated project archive
+metadata.zip
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/

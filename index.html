@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Allow Kaspersky + Vite HMR + local dev: relax CSP for dev only -->
+    <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * ws: wss: http://gc.kis.v2.scr.kaspersky-labs.com ws://gc.kis.v2.scr.kaspersky-labs.com http://localhost:* https://localhost:* http://127.0.0.1:* ws://127.0.0.1:* http://0.0.0.0:* ws://0.0.0.0:* http://192.168.*:* ws://192.168.*:* http://10.*:* ws://10.*:*; script-src * 'unsafe-inline' 'unsafe-eval' blob:; style-src * 'unsafe-inline' data: blob:; img-src * data: blob:; media-src * data: blob:;" />
+    <title>Vexo - AI Creative Suite</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
