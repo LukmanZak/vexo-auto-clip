@@ -42,7 +42,10 @@ export interface FaceTrack {
   x: number; // 0-1 normalized center x
   y: number; // 0-1 normalized center y
   width: number; // normalized
+  height: number; // normalized
 }
+
+const clamp01 = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 
 export async function detectFacesInVideo(
   video: HTMLVideoElement,
@@ -95,7 +98,7 @@ export async function detectFacesInVideo(
     const result: any = lm.detectForVideo(video, performance.now());
     if (result.detections && result.detections.length > 0) {
       // use detections bounding box (more stable than landmarks for box)
-      let bestX = 0.5, bestY = 0.5, bestW = 0;
+      let bestX = 0.5, bestY = 0.5, bestW = 0, bestH = 0;
       let bestArea = 0;
       for (const det of result.detections) {
         const b = det.boundingBox;
@@ -114,6 +117,7 @@ export async function detectFacesInVideo(
           bestX = cx;
           bestY = cy;
           bestW = nw;
+          bestH = nh;
         }
       }
       if (bestArea === 0 && result.faceLandmarks && result.faceLandmarks.length > 0) {
@@ -134,14 +138,18 @@ export async function detectFacesInVideo(
             bestX = (minX + maxX) / 2;
             bestY = (minY + maxY) / 2;
             bestW = w;
+            bestH = h;
           }
         }
       }
       // clamp 0-1
-      bestX = Math.max(0.05, Math.min(0.95, bestX));
-      tracks.push({ time: t, x: bestX, y: bestY, width: bestW || 0.18 });
+      bestX = clamp01(bestX);
+      bestY = clamp01(bestY);
+      bestW = clamp01(bestW);
+      bestH = clamp01(bestH || bestW * 1.35);
+      tracks.push({ time: t, x: bestX, y: bestY, width: bestW || 0.18, height: bestH || 0.24 });
     } else if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-      let bestX = 0.5, bestY = 0.5, bestW = 0;
+      let bestX = 0.5, bestY = 0.5, bestW = 0, bestH = 0;
       let bestArea = 0;
       for (const landmarks of result.faceLandmarks) {
         let minX = 1, maxX = 0, minY = 1, maxY = 0;
@@ -159,11 +167,12 @@ export async function detectFacesInVideo(
           bestX = (minX + maxX) / 2;
           bestY = (minY + maxY) / 2;
           bestW = w;
+          bestH = h;
         }
       }
-      tracks.push({ time: t, x: Math.max(0.05, Math.min(0.95, bestX)), y: bestY, width: bestW });
+      tracks.push({ time: t, x: clamp01(bestX), y: clamp01(bestY), width: clamp01(bestW), height: clamp01(bestH || bestW * 1.35) });
     } else {
-      tracks.push({ time: t, x: 0.5, y: 0.5, width: 0 });
+      tracks.push({ time: t, x: 0.5, y: 0.5, width: 0, height: 0 });
     }
     onProgress?.(Math.round(((t + sampleIntervalSec) / duration) * 100));
   }
