@@ -5,6 +5,9 @@ dist/
 # Runtime inputs and generated media
 /temp/
 
+# Large local ML weights (install separately on each machine)
+/models/
+
 # Generated project archive
 metadata.zip
 

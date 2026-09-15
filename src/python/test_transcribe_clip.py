@@ -3,10 +3,17 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from transcribe_clip import group_words_into_captions
+from transcribe_clip import group_words_into_captions, naturalize_caption_text
 
 
 class CaptionGroupingTests(unittest.TestCase):
+    def test_naturalizes_noise_without_emoji_or_emdash(self):
+        text = naturalize_caption_text("eh  halo guys — ini keren 😄!!")
+
+        self.assertEqual(text, "Halo guys, ini keren!")
+        self.assertNotIn("—", text)
+        self.assertNotIn("😄", text)
+
     def test_splits_words_into_short_readable_sections(self):
         words = [
             {"start": 0.0, "end": 0.2, "word": "Kali"},

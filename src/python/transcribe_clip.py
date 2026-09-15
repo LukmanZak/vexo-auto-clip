@@ -7,12 +7,49 @@ stdout is always JSON so the Express server can consume it safely.
 import argparse
 import json
 import os
+import re
 import sys
+import unicodedata
 from typing import Any
 
 MAX_WORDS = 8
 MAX_CAPTION_SECONDS = 2.7
 MIN_WORDS_FOR_PUNCTUATION_BREAK = 3
+
+EMOJI_RE = re.compile(
+    "["
+    "\\U0001F1E0-\\U0001F1FF"
+    "\\U0001F300-\\U0001FAFF"
+    "\\U00002700-\\U000027BF"
+    "\\U00002600-\\U000026FF"
+    "]+"
+)
+EM_DASH_RE = re.compile(r"[\u2010-\u2015\u2212\u2E3A\u2E3B]")
+LEADING_FILLER_RE = re.compile(r"^(?:eh+|em+|eee+|hmm+|hm+|uh+)(?:[,.!?]?\s+)+", re.IGNORECASE)
+
+
+def naturalize_caption_text(value: str) -> str:
+    """Clean Whisper fragments for natural Indonesian subtitles.
+
+    This intentionally does not translate or rewrite the spoken words. It only
+    removes transcription noise, normalizes punctuation/spacing, strips emoji
+    and replaces em-dashes so captions remain readable and consistent.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = EMOJI_RE.sub("", text)
+    text = EM_DASH_RE.sub(", ", text)
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([,!?]){2,}", r"\1", text)
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" -")
+    text = LEADING_FILLER_RE.sub("", text).strip()
+    if text:
+        first_alpha = next((index for index, char in enumerate(text) if char.isalpha()), None)
+        if first_alpha is not None:
+            text = text[:first_alpha] + text[first_alpha].upper() + text[first_alpha + 1:]
+    return text
 
 
 def group_words_into_captions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -28,7 +65,7 @@ def group_words_into_captions(words: list[dict[str, Any]]) -> list[dict[str, Any
             {
                 "start": round(float(current[0]["start"]), 3),
                 "end": round(float(current[-1]["end"]), 3),
-                "text": " ".join(str(item["word"]).strip() for item in current).strip(),
+                "text": naturalize_caption_text(" ".join(str(item["word"]).strip() for item in current)),
             }
         )
         current = []
@@ -101,7 +138,7 @@ def transcribe(video_path: str, model_name: str) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("video_path")
-    parser.add_argument("--model", default=os.getenv("WHISPER_MODEL", "medium"))
+    parser.add_argument("--model", default=os.getenv("WHISPER_MODEL", "small"))
     args = parser.parse_args()
 
     if not os.path.isfile(args.video_path):

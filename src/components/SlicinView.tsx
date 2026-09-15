@@ -16,6 +16,7 @@ import {
   Play,
   Scissors,
   Sparkles,
+  Upload,
   Video,
 } from "lucide-react";
 import { cn } from "../lib/utils";
@@ -96,6 +97,9 @@ export const SlicinView = () => {
   const [videoName, setVideoName] = useState("");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [downloadQuality, setDownloadQuality] = useState<DownloadQuality>("720");
+  const [sourceKind, setSourceKind] = useState<"youtube" | "file" | null>(null);
+  const [sourceName, setSourceName] = useState("");
+  const [sourceUrl, setSourceUrl] = useState("");
   const [mode, setMode] = useState<"podcast" | "gaming">("podcast");
   const [clips, setClips] = useState<Clip[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -107,12 +111,14 @@ export const SlicinView = () => {
   const [rawExports, setRawExports] = useState<Record<string, string>>({});
   const [exports, setExports] = useState<Record<string, string>>({});
   const [captionFiles, setCaptionFiles] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<"download" | "analyze" | "track" | string | null>(null);
+  const [busy, setBusy] = useState<"upload" | "download" | "analyze" | "track" | string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<{ progress: number; status: string; message: string } | null>(null);
   const [progress, setProgress] = useState(0);
   const [renderPhase, setRenderPhase] = useState<{ clipId: string; phase: "preparing" | "countdown" | "tracking" | "rendering"; countdown?: number } | null>(null);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null);
   const [message, setMessage] = useState<{ type: "error" | "info" | "success"; text: string } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => () => {
     if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
@@ -157,6 +163,9 @@ export const SlicinView = () => {
     }
     if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
     setVideoName("");
+    setSourceKind(null);
+    setSourceName("");
+    setSourceUrl("");
     setVideoUrl("");
     setVideoPath("");
     setRawExports({});
@@ -164,21 +173,82 @@ export const SlicinView = () => {
     setExports({});
     setCaptionFiles({});
     setBusy("download");
+    setDownloadProgress({ progress: 0, status: "queued", message: "Menyiapkan download..." });
     setMessage({ type: "info", text: "Mengunduh video YouTube ke server lokal..." });
+    const jobId = `download-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let progressTimer: number | undefined;
+    const pollDownloadProgress = async () => {
+      try {
+        const response = await fetch(`/api/youtube/download-progress/${encodeURIComponent(jobId)}`);
+        if (response.ok) {
+          const next = await response.json();
+          setDownloadProgress(next);
+          if (next.status !== "complete" && next.status !== "error") progressTimer = window.setTimeout(() => void pollDownloadProgress(), 500);
+        } else {
+          progressTimer = window.setTimeout(() => void pollDownloadProgress(), 700);
+        }
+      } catch {
+        progressTimer = window.setTimeout(() => void pollDownloadProgress(), 1000);
+      }
+    };
+    void pollDownloadProgress();
     try {
       const data = await fetchJsonWithTimeout("/api/youtube/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, quality: downloadQuality }),
+        body: JSON.stringify({ url, quality: downloadQuality, jobId }),
       });
       setVideoPath(data.videoPath);
       setVideoName(data.filename || `YouTube ${data.videoId || "video"}`);
       setVideoUrl(data.videoUrl || "");
+      setSourceKind("youtube");
+      setSourceName(data.sourceName || `YouTube ${data.videoId || "video"}`);
+      setSourceUrl(data.sourceUrl || url);
+      setDownloadProgress({ progress: 100, status: "complete", message: "Download selesai." });
       setMessage({ type: "success", text: `${data.cached ? "Video sudah ada di cache" : "Video berhasil diunduh"} (${data.quality === "best" ? "terbaik" : `${data.quality}p`}) dan otomatis dipilih.` });
     } catch (error: any) {
+      setDownloadProgress({ progress: 0, status: "error", message: error.message || "Download gagal" });
       showError(error.message);
     } finally {
+      if (progressTimer) window.clearTimeout(progressTimer);
       setBusy(null);
+    }
+  };
+
+  const handleVideoChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const looksLikeVideo = file.type.startsWith("video/") || /\.(mp4|mov|webm|mkv|m4v|avi)$/i.test(file.name);
+    if (!looksLikeVideo) {
+      showError("Pilih file video yang valid.");
+      return;
+    }
+    if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
+    setVideoName(file.name);
+    setSourceKind(null);
+    setSourceName(file.name);
+    setSourceUrl("");
+    setDownloadProgress(null);
+    setVideoUrl(URL.createObjectURL(file));
+    setVideoPath("");
+    setRawExports({});
+    setTracks([]);
+    setExports({});
+    setCaptionFiles({});
+    setBusy("upload");
+    setMessage({ type: "info", text: "Mengupload file video ke server lokal..." });
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const data = await fetchJsonWithTimeout("/api/upload-video", { method: "POST", body: form });
+      setVideoPath(data.videoPath);
+      setSourceKind("file");
+      setMessage({ type: "success", text: `${file.name} berhasil diupload dan otomatis dipilih sebagai sumber.` });
+    } catch (error: any) {
+      showError(`Upload file gagal: ${error.message}`);
+    } finally {
+      setBusy(null);
+      event.target.value = "";
     }
   };
 
@@ -193,7 +263,7 @@ export const SlicinView = () => {
       setTranscript(sourceLines);
     }
     if (!videoPath) {
-      showError("Download video YouTube dulu sebelum Analyze.");
+      showError("Pilih atau upload video terlebih dahulu sebelum Analyze.");
       return;
     }
     setBusy("analyze");
@@ -255,7 +325,7 @@ export const SlicinView = () => {
 
   const exportClip = async (clip: Clip): Promise<boolean> => {
     if (!videoPath) {
-      showError("Video YouTube belum diunduh.");
+      showError("Video belum dipilih atau diunduh.");
       return false;
     }
     const key = `${clip.id}-${aspect}`;
@@ -288,6 +358,8 @@ export const SlicinView = () => {
               subtitleLines: [],
               faceTracks: [],
               version: 3,
+              sourceName,
+              sourceUrl,
             }),
           });
           sourcePath = raw.outputPath;
@@ -342,6 +414,8 @@ export const SlicinView = () => {
           faceTracks: smartCrop ? sourceTracks : [],
           sampleInterval,
           version: 3,
+          sourceName,
+          sourceUrl,
         }),
       });
       setExports((current) => ({ ...current, [key]: data.outputPath }));
@@ -382,7 +456,16 @@ export const SlicinView = () => {
     return next;
   });
 
-  const canInput = transcript.length > 0 && !!videoPath;
+  const transcriptFromInput = transcript.length ? transcript : parseObsidianMarkdown(obsidianText);
+  const continueToAnalyze = () => {
+    if (!transcriptFromInput.length) {
+      showError("Timestamp belum ditemukan. Paste transcript lalu klik Parse transcript, atau gunakan format seperti **0:03** · kalimat.");
+      return;
+    }
+    if (!transcript.length) setTranscript(transcriptFromInput);
+    setStep(2);
+  };
+  const canInput = transcriptFromInput.length > 0 && !!videoPath;
   const canAnalyze = clips.length > 0;
 
   return (
@@ -393,7 +476,7 @@ export const SlicinView = () => {
           <span className="text-[10px] font-black uppercase tracking-[0.25em] text-yellow-400">Context Slicer</span>
         </div>
         <h1 className="text-4xl font-black tracking-tighter uppercase mt-4">Paste. <span className="text-yellow-400">Analyze.</span> Export.</h1>
-        <p className="text-sm text-white/60 mt-2 max-w-2xl">Alur khusus workflow kamu: copy-paste transcript, masukkan URL YouTube, pilih clip, lalu export ke format short-form.</p>
+        <p className="text-sm text-white/60 mt-2 max-w-2xl">Alur khusus workflow kamu: copy-paste transcript, pilih sumber dari URL YouTube atau file lokal, pilih clip, lalu export ke format short-form.</p>
       </header>
 
       <div className="glass-card p-3 flex gap-2">
@@ -411,7 +494,7 @@ export const SlicinView = () => {
       <div className="glass-card p-6 min-h-[520px]">
         <AnimatePresence mode="wait">
           {step === 1 && <motion.div key="input" initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -16 }} className="space-y-6">
-            <div><h2 className="font-black uppercase flex items-center gap-2"><ClipboardPaste className="text-yellow-400" size={20} /> 1. Masukkan sumber</h2><p className="text-sm text-white/50 mt-1">Paste transcript lalu masukkan URL YouTube. Video akan diunduh otomatis ke server lokal.</p></div>
+            <div><h2 className="font-black uppercase flex items-center gap-2"><ClipboardPaste className="text-yellow-400" size={20} /> 1. Masukkan sumber</h2><p className="text-sm text-white/50 mt-1">Paste transcript, lalu pilih sumber video: masukkan URL YouTube untuk download otomatis atau pilih file dari folder untuk diproses lokal.</p></div>
             <section className="p-4 bg-black/30 rounded-2xl border border-white/5 space-y-3">
               <div className="flex items-center justify-between"><label className="text-xs font-black uppercase">Transcript dari Obsidian Web Clipper</label><button onClick={loadExample} className="text-[10px] text-yellow-400 hover:underline">Load contoh</button></div>
               <textarea value={obsidianText} onChange={(event) => setObsidianText(event.target.value)} placeholder="Paste isi hasil Web Clipper di sini...\nContoh: **0:03** · Ini kalimat pertama" className="w-full h-48 bg-black/40 border border-white/10 rounded-xl p-4 text-xs font-mono outline-none focus:border-yellow-400/50" />
@@ -426,17 +509,24 @@ export const SlicinView = () => {
                   <option value="1080">1080p</option>
                   <option value="720">720p</option>
                 </select>
-                <button onClick={() => void downloadVideo()} disabled={busy === "download" || !youtubeUrl.trim()} className="px-4 py-3 bg-yellow-400 text-black rounded-xl text-xs font-black uppercase flex items-center justify-center gap-2 disabled:opacity-30"><Link2 size={16} /> {busy === "download" ? "Mengunduh..." : "Download video"}</button>
+                <button onClick={() => void downloadVideo()} disabled={busy === "download" || !youtubeUrl.trim()} className="px-4 py-3 bg-yellow-400 text-black rounded-xl text-xs font-black uppercase flex items-center justify-center gap-2 disabled:opacity-30"><Link2 size={16} /> {busy === "download" ? `Mengunduh ${Math.round(downloadProgress?.progress || 0)}%` : "Download video"}</button>
               </div>
+              {busy === "download" && downloadProgress && <div className="space-y-2 rounded-xl border border-yellow-400/20 bg-yellow-400/5 p-3"><div className="flex items-center justify-between text-[11px]"><span className="text-yellow-100">{downloadProgress.message}</span><span className="font-black text-yellow-400">{Math.round(downloadProgress.progress)}%</span></div><div className="h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-yellow-400 transition-[width] duration-300" style={{ width: `${Math.max(0, Math.min(100, downloadProgress.progress))}%` }} /></div></div>}
               <p className="text-[11px] text-white/40">Kualitas memengaruhi ukuran dan kecepatan download. Download lokal memakai yt-dlp + ffmpeg; setelah selesai video otomatis menjadi sumber Analyze dan Cut.</p>
+              <div className="flex items-center gap-3 text-[10px] uppercase tracking-widest text-white/30"><span className="h-px flex-1 bg-white/10" /><span>atau</span><span className="h-px flex-1 bg-white/10" /></div>
+              <input ref={fileInputRef} type="file" accept="video/*,.mp4,.mov,.webm" onChange={handleVideoChange} className="hidden" />
+              <button onClick={() => fileInputRef.current?.click()} disabled={busy === "upload" || busy === "download"} className="w-full min-h-20 border-2 border-dashed border-white/10 rounded-2xl flex items-center justify-center gap-3 hover:border-yellow-400/50 transition disabled:opacity-50"><Upload size={20} className="text-yellow-400" /><span className="text-xs font-black uppercase">{busy === "upload" ? "Uploading..." : "Pilih file dari folder"}</span><span className="text-[11px] text-white/40">MP4, MOV, WebM • diproses lokal</span></button>
+              <p className="text-[11px] text-white/40">File dari folder di-upload ke server lokal terlebih dahulu. Browser tidak memberikan path Windows mentah, jadi file besar perlu waktu untuk ditransfer.</p>
               {videoName && <div className="text-xs text-green-400 break-all">✓ {videoName}</div>}
+              {sourceKind && <div className="text-[11px] text-white/40">Sumber aktif: <span className="text-yellow-400 font-bold">{sourceKind === "youtube" ? "YouTube download" : "File lokal"}</span></div>}
+              {sourceName && <div className="text-[11px] text-white/40 break-all">Src: <span className="text-white/70">{sourceName}</span>{sourceUrl && <> · <a href={sourceUrl} target="_blank" rel="noreferrer" className="text-yellow-400 hover:underline">buka link</a></>}</div>}
               {videoUrl && <video ref={videoRef} src={videoUrl} controls muted playsInline className="w-full max-h-56 rounded-xl bg-black object-contain" />}
             </section>
-            <div className="flex justify-end"><button onClick={() => setStep(2)} disabled={!canInput} className="px-6 py-3 bg-yellow-400 text-black rounded-xl text-xs font-black uppercase flex items-center gap-2 disabled:opacity-30">Lanjut Analyze <ChevronRight size={16} /></button></div>
+            <div className="flex justify-end"><button onClick={continueToAnalyze} disabled={!canInput} className="px-6 py-3 bg-yellow-400 text-black rounded-xl text-xs font-black uppercase flex items-center gap-2 disabled:opacity-30">Lanjut Analyze <ChevronRight size={16} /></button></div>
           </motion.div>}
 
           {step === 2 && <motion.div key="analyze" initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -16 }} className="space-y-6">
-            <div><h2 className="font-black uppercase flex items-center gap-2"><Cpu className="text-yellow-400" size={20} /> 2. Cari kandidat clip</h2><p className="text-sm text-white/50 mt-1">Gemini menganalisis transcript yang kamu paste; video YouTube sudah diunduh lokal dan dipakai sebagai sumber cut.</p></div>
+            <div><h2 className="font-black uppercase flex items-center gap-2"><Cpu className="text-yellow-400" size={20} /> 2. Cari kandidat clip</h2><p className="text-sm text-white/50 mt-1">Gemini menganalisis transcript yang kamu paste; sumber video aktif dipakai sebagai bahan cut.</p></div>
             <div className="grid grid-cols-2 gap-3"><button onClick={() => setMode("podcast")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "podcast" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Mic2 size={18} /> Podcast</button><button onClick={() => setMode("gaming")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "gaming" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Gamepad2 size={18} /> Gaming</button></div>
             <div className="p-4 bg-black/30 rounded-2xl text-xs font-mono text-white/50 max-h-52 overflow-auto">{transcript.slice(0, 14).map((line, index) => <div key={index}>[{secondsToTime(line.start)}] {line.text}</div>)}{transcript.length > 14 && <div className="text-yellow-400">... +{transcript.length - 14} baris</div>}</div>
             <button onClick={analyze} disabled={busy === "analyze" || !canInput} className="w-full py-4 bg-yellow-400 text-black rounded-2xl font-black uppercase flex justify-center items-center gap-2 disabled:opacity-30">{busy === "analyze" ? <Loader2 className="animate-spin" /> : <Cpu size={18} />} {busy === "analyze" ? "Gemini sedang menganalisis..." : "Analyze transcript"}</button>
@@ -450,11 +540,11 @@ export const SlicinView = () => {
             <div className="grid grid-cols-4 gap-2">{(["9:16", "1:1", "4:5", "original"] as Aspect[]).map((item) => <button key={item} onClick={() => setAspect(item)} className={cn("py-3 rounded-xl border text-xs font-black", aspect === item ? "bg-yellow-400 text-black border-yellow-400" : "bg-white/5 border-white/10 text-white/60")}>{item}</button>)}</div>
             {renderPhase && <div className="p-4 rounded-2xl border border-yellow-400/30 bg-yellow-400/10 text-yellow-100 flex items-center gap-3"><div className="w-10 h-10 rounded-full bg-yellow-400 text-black flex items-center justify-center font-black text-lg">{renderPhase.phase === "countdown" ? renderPhase.countdown : <Loader2 className="animate-spin" size={18} />}</div><div><div className="text-sm font-black uppercase">{renderPhase.phase === "preparing" ? "Memotong clip original" : renderPhase.phase === "countdown" ? "Siap merekam crop" : renderPhase.phase === "tracking" ? "Model membaca wajah" : "Merender hasil crop"}</div><div className="text-xs text-yellow-100/70">{renderPhase.phase === "preparing" ? "Video dipotong sesuai timestamp tanpa crop." : renderPhase.phase === "countdown" ? "Bounding box akan menjadi panduan crop sesuai ratio pilihan." : renderPhase.phase === "tracking" ? "BlazeFace mengikuti wajah dari clip original." : "Audio dan video disusun ulang dengan timestamp yang sama."}</div></div></div>}
             <div className="p-4 rounded-2xl border border-white/10 bg-white/[0.03] text-xs text-white/60"><span className="font-bold text-white">Alur Face-follow:</span> clip dipotong dulu dalam ratio original, model membaca wajah pada clip tersebut, lalu crop akhir dibuat sesuai ratio {aspect}. Klik tombol Face-follow pada clip yang ingin diproses.</div>
-            <label className="flex items-center gap-3 p-4 bg-white/[0.03] rounded-2xl border border-white/10 cursor-pointer"><input type="checkbox" checked={burnCaptions} onChange={(event) => setBurnCaptions(event.target.checked)} className="accent-yellow-400 w-4 h-4" /><div><div className="text-sm font-bold">Caption sinkron Whisper Medium</div><div className="text-xs text-white/50">Video dipotong dulu, lalu Whisper Medium membuat caption pendek dari word timestamps sebelum export final. Export pertama mengunduh model dan dapat memerlukan beberapa menit di CPU.</div></div></label>
+            <label className="flex items-center gap-3 p-4 bg-white/[0.03] rounded-2xl border border-white/10 cursor-pointer"><input type="checkbox" checked={burnCaptions} onChange={(event) => setBurnCaptions(event.target.checked)} className="accent-yellow-400 w-4 h-4" /><div><div className="text-sm font-bold">Caption sinkron Whisper Small</div><div className="text-xs text-white/50">Video dipotong dulu, lalu Whisper Small lokal membuat caption pendek dari word timestamps sebelum export final. Jika model belum ada di folder models, faster-whisper akan menyiapkannya saat pertama kali dipakai.</div></div></label>
             {aspect !== "original" && <div className="p-4 bg-white/[0.03] rounded-2xl border border-white/10 space-y-3"><label className="flex items-center gap-3 text-sm font-bold"><input type="checkbox" checked={smartCrop} onChange={(event) => setSmartCrop(event.target.checked)} className="accent-yellow-400 w-4 h-4" /> Face-follow crop</label>{smartCrop && <><p className="text-[11px] text-white/50">Setelah klik Face-follow, clip original dipotong dulu, lalu model dan countdown berjalan khusus untuk clip itu.</p><div className="flex justify-between text-xs text-white/50"><span>Sampling gerakan</span><span className="text-yellow-400">{sampleInterval}s</span></div><input type="range" min={0.2} max={1} step={0.05} value={sampleInterval} onChange={(event) => setSampleInterval(Number(event.target.value))} className="w-full accent-yellow-400" /></>}</div>}
             <button onClick={exportSelected} disabled={!selectedIds.size || !!busy} className="w-full py-4 bg-yellow-400 text-black rounded-2xl font-black uppercase flex justify-center gap-2 disabled:opacity-30"><Download size={18} /> {batchProgress ? `Export clip ${batchProgress.current}/${batchProgress.total}` : `Export ${selectedIds.size} clip`}</button>
             <div className="space-y-3">{clips.filter((clip) => selectedIds.has(clip.id)).map((clip) => { const key = `${clip.id}-${aspect}`; const rawKey = `${clip.id}-raw`; const isRendering = renderPhase?.clipId === clip.id; return <div key={clip.id} className="p-4 rounded-2xl border border-white/10 bg-white/[0.03] flex items-center justify-between gap-3"><div><div className="font-bold text-sm">{clip.title || clip.context}</div><div className="text-xs font-mono text-white/50">{clip.startTime} – {clip.endTime} · {secondsToTime(clipDuration(clip))}</div>{rawExports[rawKey] && <div className="text-[11px] text-white/50 mt-1">✓ Original clip siap untuk tracking</div>}{exports[key] && <div className="text-[11px] text-green-400 break-all mt-1">✓ Video: {exports[key]}</div>}{captionFiles[key] && <div className="text-[11px] text-blue-300 break-all mt-1">✓ Caption: {captionFiles[key]}</div>}</div><button onClick={() => exportClip(clip)} disabled={!!busy} className="shrink-0 px-3 py-2 bg-white/10 rounded-xl text-xs font-black flex items-center gap-2">{isRendering ? <Loader2 className="animate-spin" size={14} /> : <Play size={14} />} {isRendering ? "Proses…" : aspect === "original" || !smartCrop ? "Export clip" : rawExports[rawKey] ? "Face-follow render" : "Potong + Face-follow"}</button></div>; })}</div>
-            <div className="flex justify-between"><button onClick={() => setStep(2)} className="px-5 py-3 bg-white/10 rounded-xl text-xs font-black uppercase flex items-center gap-2"><ChevronLeft size={16} /> Kembali</button><button onClick={() => { setStep(1); setClips([]); setTranscript([]); setTracks([]); setRawExports({}); setExports({}); setCaptionFiles({}); }} className="px-5 py-3 bg-white/5 border border-white/10 rounded-xl text-xs font-black uppercase">Mulai baru</button></div>
+            <div className="flex justify-between"><button onClick={() => setStep(2)} className="px-5 py-3 bg-white/10 rounded-xl text-xs font-black uppercase flex items-center gap-2"><ChevronLeft size={16} /> Kembali</button><button onClick={() => { if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl); setStep(1); setClips([]); setTranscript([]); setTracks([]); setRawExports({}); setExports({}); setCaptionFiles({}); setVideoPath(""); setVideoName(""); setVideoUrl(""); setYoutubeUrl(""); setSourceKind(null); setSourceName(""); setSourceUrl(""); }} className="px-5 py-3 bg-white/5 border border-white/10 rounded-xl text-xs font-black uppercase">Mulai baru</button></div>
           </motion.div>}
         </AnimatePresence>
       </div>

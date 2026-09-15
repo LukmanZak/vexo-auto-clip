@@ -10,7 +10,7 @@ import { GoogleGenAI } from "@google/genai";
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3001;
+const PORT = Number(process.env.PORT) || 3333;
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -41,11 +41,20 @@ const THUMB_DIR = path.join(TEMP_DIR, "thumbs");
 const CLIP_DIR = path.join(TEMP_DIR, "clips");
 const DOWNLOAD_DIR = path.join(TEMP_DIR, "downloads");
 const UPLOAD_DIR = path.join(TEMP_DIR, "uploads");
+type YoutubeDownloadProgress = { progress: number; status: "queued" | "downloading" | "processing" | "complete" | "error"; message: string; error?: string };
+const youtubeDownloadProgress = new Map<string, YoutubeDownloadProgress>();
 for (const d of [TEMP_DIR, THUMB_DIR, CLIP_DIR, DOWNLOAD_DIR, UPLOAD_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 800 * 1024 * 1024 } });
+// Browser file inputs cannot expose the user's absolute path to JavaScript, so
+// local files are streamed to this local server before Analyze/Cut. Keep the
+// limit high enough for long-form recordings (the default is 4 GiB) while
+// allowing deployments to tune it with MAX_UPLOAD_GB.
+const configuredUploadGb = Number.parseFloat(String(process.env.MAX_UPLOAD_GB || "4"));
+const maxUploadGb = Number.isFinite(configuredUploadGb) && configuredUploadGb > 0 ? configuredUploadGb : 4;
+const maxUploadBytes = Math.floor(maxUploadGb * 1024 ** 3);
+const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: maxUploadBytes } });
 
 // Resolve videoPath yang bisa berupa absolute, relative filename, atau cuma basename dari upload
 function resolveVideoPath(p: string): string {
@@ -68,6 +77,13 @@ function resolveVideoPath(p: string): string {
 function publicTempUrl(filePath: string): string {
   const relative = path.relative(TEMP_DIR, filePath).split(path.sep).filter(Boolean);
   return `/temp/${relative.map((part) => encodeURIComponent(part)).join("/")}`;
+}
+
+function formatDownloadBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / (1024 ** exponent)).toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
 }
 
 function ytDlpCommand(): { command: string; prefix: string[] } {
@@ -105,11 +121,24 @@ function cleanCaption(value: string, fallback: string): string {
   let count = 0;
   const cleaned = String(value || fallback)
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
+    .replace(/[\u2010-\u2015\u2212]/g, ",")
     .replace(/#[\p{L}\p{N}_-]+/gu, (tag) => (count++ < 5 ? tag : ""))
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return cleaned || fallback;
+}
+
+function buildSourceAttribution(sourceName: unknown, sourceUrl: unknown): string {
+  const name = String(sourceName || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[\u2010-\u2015\u2212]/g, ",")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const url = String(sourceUrl || "").replace(/[\r\n]+/g, "").trim();
+  if (!name && !url) return "";
+  const label = name || "YouTube";
+  return `\n\nSrc: ${label}${url ? `\nLink: ${url}` : ""}`;
 }
 
 function timestampSeconds(value: string): number {
@@ -388,10 +417,16 @@ async function transcribeClipViaPython(videoPath: string): Promise<{ captions: {
   const script = path.join(process.cwd(), "src/python/transcribe_clip.py");
   const candidates = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
   let lastErr = "";
+  const localWhisperModel = path.join(process.cwd(), "models", "faster-whisper-small");
+  const configuredWhisperModel = String(process.env.WHISPER_MODEL || "").trim().replace(/^['"]|['"]$/g, "");
+  const hasLocalSmallModel = fs.existsSync(path.join(localWhisperModel, "config.json"));
+  const whisperModel = configuredWhisperModel && configuredWhisperModel !== '"'
+    ? (configuredWhisperModel.toLowerCase() === "small" && hasLocalSmallModel ? localWhisperModel : configuredWhisperModel)
+    : (hasLocalSmallModel ? localWhisperModel : "small");
   for (const exe of candidates) {
     try {
       return await new Promise((resolve, reject) => {
-        const args = [script, videoPath, "--model", process.env.WHISPER_MODEL || "medium"];
+        const args = [script, videoPath, "--model", whisperModel];
         const proc = spawn(exe, args, { shell: false });
         let out = "";
         let err = "";
@@ -472,6 +507,7 @@ app.post("/api/face/detect", async (req, res) => {
 // ---------- API: youtube download via yt-dlp ----------
 app.post("/api/youtube/download", async (req, res) => {
   const { url, videoId } = req.body;
+  const jobId = String(req.body.jobId || "").trim();
   const requestedQuality = String(req.body.quality || "best").toLowerCase();
   const quality = requestedQuality === "1080" || requestedQuality === "720" ? requestedQuality : requestedQuality === "best" ? "best" : "best";
   const id = extractVideoId(videoId || url || "");
@@ -487,50 +523,172 @@ app.post("/api/youtube/download", async (req, res) => {
     return res.status(400).json({ error: "URL YouTube tidak valid." });
   }
   if (!id || !/^[A-Za-z0-9_-]{6,}$/.test(id)) return res.status(400).json({ error: "Video ID YouTube tidak valid." });
-
-  // if already downloaded, return existing
-  const cachePrefix = `${id}_${quality}.`;
-  const existing = fs.readdirSync(DOWNLOAD_DIR).find((f) => f.startsWith(cachePrefix) && /\.(mp4|webm|mkv|mov)$/i.test(f));
-  if (existing) {
-    const p = path.join(DOWNLOAD_DIR, existing);
-    const stat = fs.statSync(p);
-    return res.json({ videoId: id, videoPath: p, videoUrl: publicTempUrl(p), filename: existing, size: stat.size, quality, cached: true });
-  }
+  if (jobId) youtubeDownloadProgress.set(jobId, { progress: 0, status: "queued", message: "Menyiapkan download..." });
 
   try {
-    const outTemplate = path.join(DOWNLOAD_DIR, `${id}_${quality}.%(ext)s`);
+    // Always use a unique output stem. Re-entering the same URL should start a
+    // fresh download instead of returning an old cache entry or overwriting a
+    // file that yt-dlp is still post-processing.
+    const outputStem = `${id}_${quality}_${Date.now()}`;
+    const outTemplate = path.join(DOWNLOAD_DIR, `${outputStem}.%(ext)s`);
+    const startedAt = Date.now();
     const yt = ytDlpCommand();
     const format = quality === "best"
       ? "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestaudio/best"
       : `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]`;
-    await new Promise<string>((resolve, reject) => {
+    const ytDlpOutput = await new Promise<string>((resolve, reject) => {
       const args = [
         "-f", format,
         "--merge-output-format", "mp4",
         "-o", outTemplate,
         "--no-playlist",
+        "--newline",
+        "--js-runtimes", "node",
+        "--progress-template", "download:VEXO_PROGRESS:%(progress._percent_str)s|%(progress.status)s|%(progress.eta)s",
+        "--print", "VEXO_META:%(duration)s|%(requested_formats.0.tbr)s|%(requested_formats.1.tbr)s|%(requested_formats.0.protocol)s|%(filesize_approx)s",
+        "--print", "VEXO_VIDEO_URL:%(requested_formats.0.url)s",
+        "--print", "VEXO_AUDIO_URL:%(requested_formats.1.url)s",
+        "--print", "VEXO_SOURCE:%(uploader)s",
+        "--print", "after_move:VEXO_PATH:%(filepath)s",
         fullUrl,
       ];
+      console.log(`[yt-dlp] mulai download ${fullUrl} (${quality})`);
       console.log(`${yt.command} ${[...yt.prefix, ...args].join(" ")}`);
       const proc = spawn(yt.command, [...yt.prefix, ...args], { shell: false });
       let stderr = "";
-      proc.stderr.on("data", (d) => (stderr += d.toString()));
-      proc.stdout.on("data", (d) => console.log(d.toString().slice(0, 500)));
-      proc.on("close", (code) => {
-        if (code === 0) resolve("");
-        else reject(new Error(`yt-dlp exit ${code}: ${stderr.slice(-800)}`));
+      let stdout = "";
+      let highestDownloadProgress = 0;
+      let estimatedTotalBytes = 0;
+      let downloadWatchTimer: ReturnType<typeof setInterval> | undefined;
+      const updateSizeBasedProgress = () => {
+        if (!jobId) return;
+        const partialFiles = fs.readdirSync(DOWNLOAD_DIR)
+          .filter((filename) => filename.startsWith(`${outputStem}.`) && filename.endsWith(".part"))
+          .map((filename) => path.join(DOWNLOAD_DIR, filename));
+        const downloadedBytes = partialFiles.reduce((total, filename) => {
+          try { return total + fs.statSync(filename).size; } catch { return total; }
+        }, 0);
+        if (downloadedBytes <= 0) return;
+        const sizeProgress = estimatedTotalBytes > 0
+          ? Math.min(98, (downloadedBytes / estimatedTotalBytes) * 100)
+          : Math.max(1, highestDownloadProgress);
+        highestDownloadProgress = Math.max(highestDownloadProgress, sizeProgress);
+        const sizeLabel = estimatedTotalBytes > 0
+          ? `${highestDownloadProgress.toFixed(1)}%`
+          : formatDownloadBytes(downloadedBytes);
+        youtubeDownloadProgress.set(jobId, { progress: highestDownloadProgress, status: "downloading", message: `Mengunduh video... ${sizeLabel}` });
+      };
+      const updateDownloadProgress = (chunk: string) => {
+        if (!jobId) return;
+        const metadata = chunk.match(/VEXO_META:([^\r\n]+)/)?.[1]?.trim();
+        if (metadata) {
+          const [duration, videoTbr, audioTbr, _protocol, aggregateSize] = metadata.split("|");
+          const durationSeconds = Number(duration);
+          const videoBitrate = Number(videoTbr);
+          const audioBitrate = Number(audioTbr);
+          const bitrateKbps = (Number.isFinite(videoBitrate) ? videoBitrate : 0) + (Number.isFinite(audioBitrate) ? audioBitrate : 0);
+          if (Number.isFinite(durationSeconds) && durationSeconds > 0 && bitrateKbps > 0) estimatedTotalBytes = durationSeconds * bitrateKbps * 125;
+          if (estimatedTotalBytes <= 0 && Number.isFinite(Number(aggregateSize)) && Number(aggregateSize) > 0) estimatedTotalBytes = Number(aggregateSize);
+        }
+        const streamUrls = [...chunk.matchAll(/VEXO_(?:VIDEO|AUDIO)_URL:([^\r\n]+)/g)].map((match) => match[1]);
+        const streamBytes = streamUrls
+          .map((streamUrl) => Number(streamUrl.match(/(?:clen%3D|[?&]clen=)(\d+)/i)?.[1] || 0))
+          .filter((bytes) => Number.isFinite(bytes) && bytes > 0)
+          .reduce((total, bytes) => total + bytes, 0);
+        if (streamBytes > 0) estimatedTotalBytes = streamBytes;
+        const progressMatches = [...chunk.matchAll(/VEXO_PROGRESS:\s*(\d+(?:\.\d+)?)%\|([^|\r\n]*)\|([^\r\n]*)/g)];
+        const percentMatches = [...chunk.matchAll(/(?:VEXO_PROGRESS:\s*|\[download\]\s*)(\d+(?:\.\d+)?)%/g)];
+        const progressMatch = progressMatches.at(-1);
+        const percentMatch = percentMatches.at(-1);
+        const percent = Number(progressMatch?.[1] || percentMatch?.[1]);
+        const eta = String(progressMatch?.[3] || "").trim();
+        if (Number.isFinite(percent)) {
+          highestDownloadProgress = Math.max(highestDownloadProgress, Math.min(98, percent));
+          const etaLabel = eta && eta !== "NA" ? ` · ETA ${eta}` : "";
+          youtubeDownloadProgress.set(jobId, { progress: highestDownloadProgress, status: "downloading", message: `Mengunduh video... ${highestDownloadProgress.toFixed(1)}%${etaLabel}` });
+        } else if (/extracting url|downloading webpage|player api|m3u8 information/i.test(chunk)) {
+          youtubeDownloadProgress.set(jobId, { progress: 1, status: "downloading", message: "Menyiapkan stream YouTube..." });
+        } else if (/downloading \d+ format|destination:/i.test(chunk)) {
+          youtubeDownloadProgress.set(jobId, { progress: 2, status: "downloading", message: "Mulai mengunduh stream video..." });
+        } else if (/merg|post-process|already been downloaded/i.test(chunk)) {
+          youtubeDownloadProgress.set(jobId, { progress: 99, status: "processing", message: "Menyiapkan file video..." });
+        }
+      };
+      if (jobId) youtubeDownloadProgress.set(jobId, { progress: 0, status: "downloading", message: "Mengunduh video..." });
+      if (jobId) downloadWatchTimer = setInterval(updateSizeBasedProgress, 500);
+      proc.stderr.on("data", (d) => {
+        const chunk = d.toString();
+        stderr += chunk;
+        updateDownloadProgress(chunk);
+        // yt-dlp writes its live progress bar to stderr using carriage returns.
+        // Mirror it to the server terminal so a long download is visibly active.
+        process.stdout.write(`[yt-dlp] ${chunk}`);
       });
-      proc.on("error", (e: any) => reject(new Error(`yt-dlp spawn: ${e.message}`)));
+      proc.stdout.on("data", (d) => {
+        const chunk = d.toString();
+        stdout += chunk;
+        updateDownloadProgress(chunk);
+        const safeLog = chunk.replace(/VEXO_(?:VIDEO|AUDIO)_URL:[^\r\n]*/g, (line) => `${line.split(":", 1)[0]}:[redacted]`);
+        console.log(safeLog.slice(0, 500));
+      });
+      proc.on("close", (code) => {
+        if (downloadWatchTimer) clearInterval(downloadWatchTimer);
+        if (code === 0) {
+          console.log(`[yt-dlp] selesai download ${fullUrl}`);
+          if (jobId) youtubeDownloadProgress.set(jobId, { progress: 99, status: "processing", message: "Menyelesaikan file video..." });
+          resolve(`${stdout}\n${stderr}`);
+        }
+        else {
+          if (jobId) youtubeDownloadProgress.set(jobId, { progress: 0, status: "error", message: "Download gagal", error: stderr.slice(-800) });
+          reject(new Error(`yt-dlp exit ${code}: ${stderr.slice(-800)}`));
+        }
+      });
+      proc.on("error", (e: any) => {
+        if (downloadWatchTimer) clearInterval(downloadWatchTimer);
+        if (jobId) youtubeDownloadProgress.set(jobId, { progress: 0, status: "error", message: "Download gagal", error: e.message });
+        reject(new Error(`yt-dlp spawn: ${e.message}`));
+      });
     });
-    const downloaded = fs.readdirSync(DOWNLOAD_DIR).find((f) => f.startsWith(cachePrefix) && /\.(mp4|webm|mkv|mov)$/i.test(f));
-    if (!downloaded) throw new Error("yt-dlp finished but file not found");
-    const p = path.join(DOWNLOAD_DIR, downloaded);
+    const printedPath = (ytDlpOutput.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith("VEXO_PATH:"))?.slice("VEXO_PATH:".length).trim() || "").replace(/^["']|["']$/g, "");
+    const printedCandidate = printedPath ? path.resolve(printedPath) : "";
+    const fallbackCandidate = fs.readdirSync(DOWNLOAD_DIR)
+      .filter((filename) => filename.startsWith(`${outputStem}.`) && /\.(mp4|webm|mkv|mov)$/i.test(filename))
+      .map((filename) => path.join(DOWNLOAD_DIR, filename))
+      .filter((filename) => {
+        try { return fs.statSync(filename).mtimeMs >= startedAt - 5000; } catch { return false; }
+      })
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || "";
+    const p = printedCandidate && fs.existsSync(printedCandidate) ? printedCandidate : fallbackCandidate;
+    if (!p || !fs.existsSync(p)) {
+      const detail = ytDlpOutput.trim().slice(-800);
+      throw new Error(`yt-dlp selesai tetapi path file hasil tidak ditemukan. Cek output yt-dlp/FFmpeg.${detail ? ` Detail: ${detail}` : ""}`);
+    }
+    const downloaded = path.basename(p);
     const stat = fs.statSync(p);
-    res.json({ videoId: id, videoPath: p, videoUrl: publicTempUrl(p), filename: downloaded, size: stat.size, quality, cached: false });
+    const sourceName = ytDlpOutput.match(/(?:^|\r?\n)VEXO_SOURCE:(.*?)(?:\r?\n|$)/)?.[1]?.trim() || "";
+    const sourceMetadata = { sourceName, sourceUrl: fullUrl, videoId: id, quality };
+    try { fs.writeFileSync(`${p}.source.json`, JSON.stringify(sourceMetadata, null, 2), "utf8"); } catch (metadataError) { console.warn("source metadata write failed", metadataError); }
+    if (jobId) {
+      youtubeDownloadProgress.set(jobId, { progress: 100, status: "complete", message: "Download selesai." });
+      setTimeout(() => youtubeDownloadProgress.delete(jobId), 10 * 60 * 1000);
+    }
+    res.json({ videoId: id, videoPath: p, videoUrl: publicTempUrl(p), filename: downloaded, size: stat.size, quality, cached: false, sourceName, sourceUrl: fullUrl });
   } catch (e: any) {
     console.error("yt-dlp error", e);
+    if (jobId) {
+      const message = e?.message || "Download gagal";
+      youtubeDownloadProgress.set(jobId, { progress: 0, status: "error", message, error: message });
+      setTimeout(() => youtubeDownloadProgress.delete(jobId), 10 * 60 * 1000);
+    }
     res.status(500).json({ error: `Download YouTube gagal: ${e.message}`, hint: "Install yt-dlp (pip install -U yt-dlp) dan pastikan ffmpeg tersedia." });
   }
+});
+
+app.get("/api/youtube/download-progress/:jobId", (req, res) => {
+  const jobId = String(req.params.jobId || "").trim();
+  const progress = youtubeDownloadProgress.get(jobId);
+  if (!progress) return res.status(404).json({ error: "Download job tidak ditemukan" });
+  res.json(progress);
 });
 
 const slicinClipResponseSchema = {
@@ -1003,7 +1161,7 @@ function buildXExpr(tracks: FaceTrackPoint[], sSec: number, eSec: number): strin
 
 // ---------- Cut with aspect + smart crop sampling (dynamic per 2s follows face) ----------
 app.post("/api/slicin/cut", async (req, res) => {
-  const { videoPath, startTime, endTime, outputName, aspectRatio, smartCrop, faceTracks, sampleInterval, version, title, caption, subtitleLines, burnCaptions, captionEngine } = req.body;
+  const { videoPath, startTime, endTime, outputName, aspectRatio, smartCrop, faceTracks, sampleInterval, version, title, caption, subtitleLines, burnCaptions, captionEngine, sourceName, sourceUrl } = req.body;
   const ffmpegPath = process.env.FFMPEG_PATH || "";
   if (!videoPath || !startTime || !endTime) return res.status(400).json({ error: "Missing required parameters" });
   const ver = Number(version) || 3; // 1=hijau, 2=hijau+posisi, 3=bersih per-frame
@@ -1018,11 +1176,11 @@ app.post("/api/slicin/cut", async (req, res) => {
     let outputPath = path.join(CLIP_DIR, outputName || `cut_${Date.now()}.mp4`);
     const captionTitle = String(title || "Context Slicer").trim();
     const fallbackCaption = `Di bagian ini, ${captionTitle.toLowerCase()} dibahas dari ${startTime} sampai ${endTime}.`;
-    const finalCaption = cleanCaption(caption, fallbackCaption);
+    const finalCaption = `${cleanCaption(caption, fallbackCaption)}${buildSourceAttribution(sourceName, sourceUrl)}`;
     const captionFile = `${safeFilePart(captionTitle, "clip")}_${safeFilePart(startTime, "00-00")}.md`;
     const captionPath = path.join(CLIP_DIR, captionFile);
     const saveCaption = () => {
-      fs.writeFileSync(captionPath, `# ${cleanCaption(captionTitle, "Context Slicer")}\n\nWaktu: ${startTime} – ${endTime}\n\n${finalCaption}\n`);
+      fs.writeFileSync(captionPath, `# ${cleanCaption(captionTitle, "Context Slicer")}\n\nWaktu: ${startTime} sampai ${endTime}\n\n${finalCaption}\n`);
     };
     const toSec = (t: string) => {
       const p = t.split(":").map(Number);
@@ -1291,6 +1449,23 @@ app.post("/api/video/info", async (req, res) => {
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Multer errors otherwise bubble up as an HTML stack trace and the browser
+// reports only "Failed to fetch". Return a small JSON error so the UI can tell
+// the user whether the local file exceeded the configured upload limit.
+app.use((error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({
+      error: `File terlalu besar. Maksimum upload saat ini ${formatDownloadBytes(maxUploadBytes)}.`,
+      code: error.code,
+    });
+  }
+  if (error) {
+    console.error("Request error:", error);
+    return res.status(500).json({ error: error.message || "Request gagal diproses." });
+  }
+  return next();
 });
 
 async function startServer() {
