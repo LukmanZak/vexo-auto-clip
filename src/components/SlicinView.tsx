@@ -34,10 +34,19 @@ interface Clip {
   context?: string;
   caption?: string;
   viralPotential?: number;
+  category?: "comedy" | "mystery" | "education";
 }
+
+type PodcastCategory = NonNullable<Clip["category"]>;
+const PODCAST_CATEGORY_OPTIONS: { id: PodcastCategory; label: string; hint: string }[] = [
+  { id: "comedy", label: "Comedy", hint: "setup, punchline, reaksi" },
+  { id: "mystery", label: "Mystery", hint: "pertanyaan, mitos, reveal" },
+  { id: "education", label: "Edukasi", hint: "penjelasan utuh" },
+];
 
 type Aspect = "9:16" | "1:1" | "4:5" | "original";
 type DownloadQuality = "best" | "1080" | "720";
+type WhisperModelChoice = "small" | "medium";
 
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
@@ -101,11 +110,14 @@ export const SlicinView = () => {
   const [sourceName, setSourceName] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
   const [mode, setMode] = useState<"podcast" | "gaming">("podcast");
+  const [podcastCategories, setPodcastCategories] = useState<PodcastCategory[]>([]);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [analysisWarnings, setAnalysisWarnings] = useState<string[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [aspect, setAspect] = useState<Aspect>("9:16");
   const [smartCrop, setSmartCrop] = useState(true);
   const [burnCaptions, setBurnCaptions] = useState(false);
+  const [whisperModel, setWhisperModel] = useState<WhisperModelChoice>("small");
   const [sampleInterval, setSampleInterval] = useState(0.25);
   const [tracks, setTracks] = useState<FaceTrack[]>([]);
   const [rawExports, setRawExports] = useState<Record<string, string>>({});
@@ -125,6 +137,20 @@ export const SlicinView = () => {
   }, [videoUrl]);
 
   const showError = (text: string) => setMessage({ type: "error", text });
+
+  const changeMode = (nextMode: "podcast" | "gaming") => {
+    setMode(nextMode);
+    setClips([]);
+    setSelectedIds(new Set());
+    setAnalysisWarnings([]);
+  };
+
+  const togglePodcastCategory = (category: PodcastCategory) => {
+    setPodcastCategories((current) => current.includes(category) ? current.filter((item) => item !== category) : [...current, category]);
+    setClips([]);
+    setSelectedIds(new Set());
+    setAnalysisWarnings([]);
+  };
 
   const parseSource = () => {
     const lines = parseObsidianMarkdown(obsidianText);
@@ -266,18 +292,23 @@ export const SlicinView = () => {
       showError("Pilih atau upload video terlebih dahulu sebelum Analyze.");
       return;
     }
+    if (mode === "podcast" && podcastCategories.length === 0) {
+      showError("Pilih minimal satu kategori podcast terlebih dahulu.");
+      return;
+    }
     setBusy("analyze");
     setMessage(null);
     try {
       const response = await fetch("/api/slicin/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: sourceLines, videoPath, mode, apiKey: effectiveApiKey }),
+        body: JSON.stringify({ transcript: sourceLines, videoPath, mode, categories: mode === "podcast" ? podcastCategories : undefined, apiKey: effectiveApiKey }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Analyze gagal");
       const nextClips = data.clips || [];
       setClips(nextClips);
+      setAnalysisWarnings(Array.isArray(data.warnings) ? data.warnings : []);
       setSelectedIds(new Set(nextClips.map((clip: Clip) => clip.id)));
       setStep(2);
       setMessage({ type: "success", text: `${nextClips.length} kandidat clip ditemukan. Pilih yang mau diekspor.` });
@@ -297,7 +328,7 @@ export const SlicinView = () => {
     setBusy("track");
     setProgress(0);
     try {
-      setMessage({ type: "info", text: "Menjalankan tracker Python OpenCV + MediaPipe..." });
+      setMessage({ type: "info", text: "Mendeteksi frame dengan tracker Python OpenCV + MediaPipe..." });
       const data = await fetchJsonWithTimeout("/api/face/detect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -410,6 +441,7 @@ export const SlicinView = () => {
           smartCrop: smartCrop && aspect !== "original",
           burnCaptions,
           captionEngine: "whisper",
+          whisperModel,
           subtitleLines: sourceTranscript,
           faceTracks: smartCrop ? sourceTracks : [],
           sampleInterval,
@@ -467,6 +499,11 @@ export const SlicinView = () => {
   };
   const canInput = transcriptFromInput.length > 0 && !!videoPath;
   const canAnalyze = clips.length > 0;
+  const canRunAnalyze = canInput && (mode === "gaming" || podcastCategories.length > 0);
+  const clipsByCategory = PODCAST_CATEGORY_OPTIONS.reduce<Record<string, Clip[]>>((groups, category) => {
+    groups[category.id] = clips.filter((clip) => clip.category === category.id);
+    return groups;
+  }, {});
 
   return (
     <div className="max-w-5xl mx-auto px-6 lg:px-8 py-8 space-y-6 pb-24">
@@ -527,10 +564,13 @@ export const SlicinView = () => {
 
           {step === 2 && <motion.div key="analyze" initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -16 }} className="space-y-6">
             <div><h2 className="font-black uppercase flex items-center gap-2"><Cpu className="text-yellow-400" size={20} /> 2. Cari kandidat clip</h2><p className="text-sm text-white/50 mt-1">Gemini menganalisis transcript yang kamu paste; sumber video aktif dipakai sebagai bahan cut.</p></div>
-            <div className="grid grid-cols-2 gap-3"><button onClick={() => setMode("podcast")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "podcast" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Mic2 size={18} /> Podcast</button><button onClick={() => setMode("gaming")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "gaming" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Gamepad2 size={18} /> Gaming</button></div>
+            <div className="grid grid-cols-2 gap-3"><button onClick={() => changeMode("podcast")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "podcast" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Mic2 size={18} /> Podcast</button><button onClick={() => changeMode("gaming")} className={cn("p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs font-black uppercase", mode === "gaming" ? "bg-yellow-400/10 border-yellow-400 text-yellow-400" : "border-white/10 text-white/50")}><Gamepad2 size={18} /> Gaming</button></div>
+            {mode === "podcast" && <section className="p-4 rounded-2xl border border-yellow-400/20 bg-yellow-400/5 space-y-3"><div><div className="text-xs font-black uppercase text-yellow-100">Pilih angle podcast</div><p className="text-[11px] text-white/50 mt-1">Pilih minimal satu. AI membaca seluruh transcript sebagai satu konteks dan mencari hingga 6 clip kuat per kategori.</p></div><div className="grid grid-cols-1 sm:grid-cols-3 gap-2">{PODCAST_CATEGORY_OPTIONS.map((category) => { const selected = podcastCategories.includes(category.id); return <button key={category.id} type="button" onClick={() => togglePodcastCategory(category.id)} className={cn("p-3 rounded-xl border text-left transition", selected ? "bg-yellow-400 text-black border-yellow-400" : "bg-white/5 border-white/10 text-white/70 hover:border-yellow-400/50")}><div className="flex items-center justify-between"><span className="text-xs font-black uppercase">{category.label}</span>{selected && <Check size={14} />}</div><div className={cn("text-[10px] mt-1", selected ? "text-black/60" : "text-white/40")}>{category.hint}</div></button>; })}</div></section>}
             <div className="p-4 bg-black/30 rounded-2xl text-xs font-mono text-white/50 max-h-52 overflow-auto">{transcript.slice(0, 14).map((line, index) => <div key={index}>[{secondsToTime(line.start)}] {line.text}</div>)}{transcript.length > 14 && <div className="text-yellow-400">... +{transcript.length - 14} baris</div>}</div>
-            <button onClick={analyze} disabled={busy === "analyze" || !canInput} className="w-full py-4 bg-yellow-400 text-black rounded-2xl font-black uppercase flex justify-center items-center gap-2 disabled:opacity-30">{busy === "analyze" ? <Loader2 className="animate-spin" /> : <Cpu size={18} />} {busy === "analyze" ? "Gemini sedang menganalisis..." : "Analyze transcript"}</button>
-            {clips.length > 0 && <div className="space-y-3"><div className="flex justify-between items-center"><h3 className="font-black uppercase text-sm">Kandidat ({clips.length})</h3><button onClick={() => setSelectedIds(new Set(clips.map((clip) => clip.id)))} className="text-xs text-yellow-400">Pilih semua</button></div>{clips.map((clip) => <button key={clip.id} onClick={() => toggle(clip.id)} className={cn("w-full text-left p-3 rounded-2xl border-2", selectedIds.has(clip.id) ? "bg-yellow-400/10 border-yellow-400" : "bg-white/[0.02] border-white/5")}><div className="flex gap-2 items-center"><span className="text-[11px] font-mono bg-white/10 px-2 py-1 rounded">{clip.startTime} – {clip.endTime}</span>{clip.viralPotential !== undefined && <span className="text-[11px] text-yellow-400">{clip.viralPotential}%</span>}{selectedIds.has(clip.id) && <Check size={14} className="text-yellow-400" />}</div><div className="font-bold text-sm mt-1">{clip.title || clip.context || "Untitled"}</div><div className="text-xs text-white/50">{clip.summary}</div></button>)}</div>}
+            <button onClick={analyze} disabled={busy === "analyze" || !canRunAnalyze} className="w-full py-4 bg-yellow-400 text-black rounded-2xl font-black uppercase flex justify-center items-center gap-2 disabled:opacity-30">{busy === "analyze" ? <Loader2 className="animate-spin" /> : <Cpu size={18} />} {busy === "analyze" ? "Gemini sedang menganalisis..." : "Analyze transcript"}</button>
+            {mode === "podcast" && !podcastCategories.length && <p className="text-xs text-yellow-200/70 text-center">Pilih minimal satu kategori agar Analyze aktif.</p>}
+            {analysisWarnings.length > 0 && <div className="p-3 rounded-xl border border-yellow-400/20 bg-yellow-400/5 text-xs text-yellow-100">{analysisWarnings.map((warning) => <div key={warning}>Catatan kualitas: {warning}</div>)}</div>}
+            {clips.length > 0 && <div className="space-y-5"><div className="flex justify-between items-center"><h3 className="font-black uppercase text-sm">Kandidat ({clips.length})</h3><button onClick={() => setSelectedIds(new Set(clips.map((clip) => clip.id)))} className="text-xs text-yellow-400">Pilih semua</button></div>{(mode === "podcast" ? PODCAST_CATEGORY_OPTIONS.filter((category) => clipsByCategory[category.id]?.length) : [{ id: "gaming", label: "Gaming" } as any]).map((group) => <section key={group.id} className="space-y-2"><div className="flex items-center gap-2"><h4 className="text-xs font-black uppercase text-yellow-100">{group.label}</h4>{mode === "podcast" && <span className="text-[10px] text-white/40">{clipsByCategory[group.id].length} clip</span>}</div>{(mode === "podcast" ? clipsByCategory[group.id] : clips).map((clip) => <button key={clip.id} onClick={() => toggle(clip.id)} className={cn("w-full text-left p-3 rounded-2xl border-2", selectedIds.has(clip.id) ? "bg-yellow-400/10 border-yellow-400" : "bg-white/[0.02] border-white/5")}><div className="flex flex-wrap gap-2 items-center"><span className="text-[11px] font-mono bg-white/10 px-2 py-1 rounded">{clip.startTime} – {clip.endTime}</span>{clip.category && <span className="text-[10px] uppercase px-2 py-1 rounded bg-blue-400/10 text-blue-200">{PODCAST_CATEGORY_OPTIONS.find((item) => item.id === clip.category)?.label || clip.category}</span>}{clip.viralPotential !== undefined && <span className="text-[11px] text-yellow-400">{Math.round(clip.viralPotential)}%</span>}{selectedIds.has(clip.id) && <Check size={14} className="text-yellow-400" />}</div><div className="font-bold text-sm mt-1">{clip.title || clip.context || "Untitled"}</div><div className="text-xs text-white/50">{clip.summary}</div><div className="text-[11px] text-white/35 mt-1">{clip.reason}</div></button>)}</section>)}</div>}
             <div className="flex justify-between"><button onClick={() => setStep(1)} className="px-5 py-3 bg-white/10 rounded-xl text-xs font-black uppercase flex items-center gap-2"><ChevronLeft size={16} /> Kembali</button><button onClick={() => setStep(3)} disabled={!canAnalyze} className="px-6 py-3 bg-yellow-400 text-black rounded-xl text-xs font-black uppercase flex items-center gap-2 disabled:opacity-30">Lanjut Export <ChevronRight size={16} /></button></div>
           </motion.div>}
 
@@ -540,11 +580,11 @@ export const SlicinView = () => {
             <div className="grid grid-cols-4 gap-2">{(["9:16", "1:1", "4:5", "original"] as Aspect[]).map((item) => <button key={item} onClick={() => setAspect(item)} className={cn("py-3 rounded-xl border text-xs font-black", aspect === item ? "bg-yellow-400 text-black border-yellow-400" : "bg-white/5 border-white/10 text-white/60")}>{item}</button>)}</div>
             {renderPhase && <div className="p-4 rounded-2xl border border-yellow-400/30 bg-yellow-400/10 text-yellow-100 flex items-center gap-3"><div className="w-10 h-10 rounded-full bg-yellow-400 text-black flex items-center justify-center font-black text-lg">{renderPhase.phase === "countdown" ? renderPhase.countdown : <Loader2 className="animate-spin" size={18} />}</div><div><div className="text-sm font-black uppercase">{renderPhase.phase === "preparing" ? "Memotong clip original" : renderPhase.phase === "countdown" ? "Siap merekam crop" : renderPhase.phase === "tracking" ? "Model membaca wajah" : "Merender hasil crop"}</div><div className="text-xs text-yellow-100/70">{renderPhase.phase === "preparing" ? "Video dipotong sesuai timestamp tanpa crop." : renderPhase.phase === "countdown" ? "Bounding box akan menjadi panduan crop sesuai ratio pilihan." : renderPhase.phase === "tracking" ? "BlazeFace mengikuti wajah dari clip original." : "Audio dan video disusun ulang dengan timestamp yang sama."}</div></div></div>}
             <div className="p-4 rounded-2xl border border-white/10 bg-white/[0.03] text-xs text-white/60"><span className="font-bold text-white">Alur Face-follow:</span> clip dipotong dulu dalam ratio original, model membaca wajah pada clip tersebut, lalu crop akhir dibuat sesuai ratio {aspect}. Klik tombol Face-follow pada clip yang ingin diproses.</div>
-            <label className="flex items-center gap-3 p-4 bg-white/[0.03] rounded-2xl border border-white/10 cursor-pointer"><input type="checkbox" checked={burnCaptions} onChange={(event) => setBurnCaptions(event.target.checked)} className="accent-yellow-400 w-4 h-4" /><div><div className="text-sm font-bold">Caption sinkron Whisper Small</div><div className="text-xs text-white/50">Video dipotong dulu, lalu Whisper Small lokal membuat caption pendek dari word timestamps sebelum export final. Jika model belum ada di folder models, faster-whisper akan menyiapkannya saat pertama kali dipakai.</div></div></label>
+            <div className="p-4 bg-white/[0.03] rounded-2xl border border-white/10 space-y-3"><label className="flex items-start gap-3 cursor-pointer"><input type="checkbox" checked={burnCaptions} onChange={(event) => setBurnCaptions(event.target.checked)} className="accent-yellow-400 w-4 h-4 mt-1" /><div><div className="text-sm font-bold">Caption sinkron Whisper</div><div className="text-xs text-white/50">Video dipotong dulu, lalu model Whisper lokal membuat caption dari word timestamps sebelum export final.</div></div></label>{burnCaptions && <div className="pl-7 flex flex-wrap items-center gap-3"><label htmlFor="whisper-model" className="text-xs font-bold text-white/70">Model</label><select id="whisper-model" aria-label="Model Whisper" value={whisperModel} onChange={(event) => setWhisperModel(event.target.value as WhisperModelChoice)} disabled={!!busy} className="bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs outline-none focus:border-yellow-400/50"><option value="small">Small · lebih cepat</option><option value="medium">Medium · lebih akurat</option></select><span className="text-[11px] text-white/40">Model dibaca dari folder lokal models/faster-whisper-{whisperModel}.</span></div>}</div>
             {aspect !== "original" && <div className="p-4 bg-white/[0.03] rounded-2xl border border-white/10 space-y-3"><label className="flex items-center gap-3 text-sm font-bold"><input type="checkbox" checked={smartCrop} onChange={(event) => setSmartCrop(event.target.checked)} className="accent-yellow-400 w-4 h-4" /> Face-follow crop</label>{smartCrop && <><p className="text-[11px] text-white/50">Setelah klik Face-follow, clip original dipotong dulu, lalu model dan countdown berjalan khusus untuk clip itu.</p><div className="flex justify-between text-xs text-white/50"><span>Sampling gerakan</span><span className="text-yellow-400">{sampleInterval}s</span></div><input type="range" min={0.2} max={1} step={0.05} value={sampleInterval} onChange={(event) => setSampleInterval(Number(event.target.value))} className="w-full accent-yellow-400" /></>}</div>}
             <button onClick={exportSelected} disabled={!selectedIds.size || !!busy} className="w-full py-4 bg-yellow-400 text-black rounded-2xl font-black uppercase flex justify-center gap-2 disabled:opacity-30"><Download size={18} /> {batchProgress ? `Export clip ${batchProgress.current}/${batchProgress.total}` : `Export ${selectedIds.size} clip`}</button>
             <div className="space-y-3">{clips.filter((clip) => selectedIds.has(clip.id)).map((clip) => { const key = `${clip.id}-${aspect}`; const rawKey = `${clip.id}-raw`; const isRendering = renderPhase?.clipId === clip.id; return <div key={clip.id} className="p-4 rounded-2xl border border-white/10 bg-white/[0.03] flex items-center justify-between gap-3"><div><div className="font-bold text-sm">{clip.title || clip.context}</div><div className="text-xs font-mono text-white/50">{clip.startTime} – {clip.endTime} · {secondsToTime(clipDuration(clip))}</div>{rawExports[rawKey] && <div className="text-[11px] text-white/50 mt-1">✓ Original clip siap untuk tracking</div>}{exports[key] && <div className="text-[11px] text-green-400 break-all mt-1">✓ Video: {exports[key]}</div>}{captionFiles[key] && <div className="text-[11px] text-blue-300 break-all mt-1">✓ Caption: {captionFiles[key]}</div>}</div><button onClick={() => exportClip(clip)} disabled={!!busy} className="shrink-0 px-3 py-2 bg-white/10 rounded-xl text-xs font-black flex items-center gap-2">{isRendering ? <Loader2 className="animate-spin" size={14} /> : <Play size={14} />} {isRendering ? "Proses…" : aspect === "original" || !smartCrop ? "Export clip" : rawExports[rawKey] ? "Face-follow render" : "Potong + Face-follow"}</button></div>; })}</div>
-            <div className="flex justify-between"><button onClick={() => setStep(2)} className="px-5 py-3 bg-white/10 rounded-xl text-xs font-black uppercase flex items-center gap-2"><ChevronLeft size={16} /> Kembali</button><button onClick={() => { if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl); setStep(1); setClips([]); setTranscript([]); setTracks([]); setRawExports({}); setExports({}); setCaptionFiles({}); setVideoPath(""); setVideoName(""); setVideoUrl(""); setYoutubeUrl(""); setSourceKind(null); setSourceName(""); setSourceUrl(""); }} className="px-5 py-3 bg-white/5 border border-white/10 rounded-xl text-xs font-black uppercase">Mulai baru</button></div>
+            <div className="flex justify-between"><button onClick={() => setStep(2)} className="px-5 py-3 bg-white/10 rounded-xl text-xs font-black uppercase flex items-center gap-2"><ChevronLeft size={16} /> Kembali</button><button onClick={() => { if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl); setStep(1); setClips([]); setSelectedIds(new Set()); setPodcastCategories([]); setAnalysisWarnings([]); setTranscript([]); setTracks([]); setRawExports({}); setExports({}); setCaptionFiles({}); setVideoPath(""); setVideoName(""); setVideoUrl(""); setYoutubeUrl(""); setSourceKind(null); setSourceName(""); setSourceUrl(""); setWhisperModel("small"); }} className="px-5 py-3 bg-white/5 border border-white/10 rounded-xl text-xs font-black uppercase">Mulai baru</button></div>
           </motion.div>}
         </AnimatePresence>
       </div>

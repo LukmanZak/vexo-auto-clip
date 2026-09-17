@@ -171,6 +171,134 @@ function normalizeClipTimestamps(clip: any, maxTranscriptTime: number): any {
   return { ...clip, startTime: normalize(clip.startTime), endTime: normalize(clip.endTime) };
 }
 
+type PodcastCategory = "comedy" | "mystery" | "education";
+const PODCAST_CATEGORIES: PodcastCategory[] = ["comedy", "mystery", "education"];
+const CATEGORY_ALIASES: Record<string, PodcastCategory> = {
+  comedy: "comedy", komedi: "comedy", humor: "comedy",
+  mystery: "mystery", misteri: "mystery",
+  education: "education", edukasi: "education", edukatif: "education",
+};
+const REACTION_MARKER = /\[(?:tertawa|berteriak|bersorak|laugh(?:ter)?|menangis|riuh|tepuk tangan|bersiul|batuk|berdehem)[^\]]*\]/i;
+
+function normalizeTranscriptText(value: unknown): string {
+  return String(value || "")
+    .replace(/\\+([\[\]])/g, "$1")
+    .replace(/\r/g, "")
+    .trim();
+}
+
+function normalizePodcastCategories(value: unknown, mode: unknown): PodcastCategory[] {
+  if (mode !== "podcast") return [];
+  const raw = Array.isArray(value) ? value : value == null ? ["comedy"] : [value];
+  return [...new Set(raw.map((item) => CATEGORY_ALIASES[String(item).trim().toLowerCase()]).filter(Boolean))] as PodcastCategory[];
+}
+
+function buildSlicinClipResponseSchema(mode: string, categories: PodcastCategory[]) {
+  const podcast = mode === "podcast";
+  const properties: Record<string, unknown> = {
+    id: { type: "string" },
+    startTime: { type: "string" },
+    endTime: { type: "string" },
+    title: { type: "string" },
+    summary: { type: "string" },
+    reason: { type: "string" },
+    transcript_snippet: { type: "string" },
+    caption: { type: "string" },
+    viralPotential: { type: "number", minimum: 0, maximum: 100 },
+  };
+  const required = ["id", "startTime", "endTime", "title", "summary", "reason", "transcript_snippet", "caption", "viralPotential"];
+  if (podcast) {
+    properties.category = { type: "string", enum: categories.length ? categories : PODCAST_CATEGORIES };
+    required.push("category");
+  }
+  return { type: "array", minItems: 1, maxItems: podcast ? Math.max(1, categories.length * 6) : 7, items: { type: "object", properties, required, additionalProperties: false } };
+}
+
+function transcriptLinesFromInput(value: unknown): { start: number; end: number; text: string }[] {
+  if (!Array.isArray(value)) return [];
+  const parsed = value.flatMap((line: any) => {
+    const start = Number(line?.start);
+    const endValue = Number(line?.end);
+    const text = normalizeTranscriptText(line?.text);
+    if (!Number.isFinite(start) || start < 0 || !text) return [];
+    return [{ start, end: Number.isFinite(endValue) && endValue > start ? endValue : start + 10, text }];
+  });
+  const merged: { start: number; end: number; text: string }[] = [];
+  const indexByStart = new Map<number, number>();
+  for (const line of parsed) {
+    const existingIndex = indexByStart.get(line.start);
+    if (existingIndex !== undefined) {
+      merged[existingIndex].text = `${merged[existingIndex].text} ${line.text}`.trim();
+      merged[existingIndex].end = Math.max(merged[existingIndex].end, line.end);
+    } else {
+      indexByStart.set(line.start, merged.length);
+      merged.push({ ...line });
+    }
+  }
+  return merged.map((line, index) => ({ ...line, end: Math.max(line.start + 0.05, Math.min(line.end, merged[index + 1]?.start ?? line.end)) }));
+}
+
+function snapPodcastBoundary(clip: any, lines: { start: number; end: number; text: string }[], category: PodcastCategory, maxTime: number): any {
+  if (!lines.length) return clip;
+  let start = Math.max(0, Math.min(maxTime, timestampSeconds(clip.startTime)));
+  let end = Math.max(start + 0.1, Math.min(maxTime, timestampSeconds(clip.endTime)));
+  const foundStartIndex = lines.findIndex((line) => line.start >= start);
+  const startIndex = foundStartIndex < 0 ? lines.length - 1 : foundStartIndex;
+  const startLineIndex = startIndex > 0 && lines[startIndex]?.start > start ? startIndex - 1 : startIndex;
+  const endLineIndex = lines.findIndex((line) => line.end >= end);
+  const safeEndIndex = endLineIndex < 0 ? lines.length - 1 : endLineIndex;
+  start = lines[Math.min(startLineIndex, lines.length - 1)].start;
+  end = Math.max(start + 0.1, lines[safeEndIndex].end);
+
+  if (category === "comedy") {
+    // Keep searching to the nearest reaction inside the 75-second clip cap;
+    // reaction markers are often a few transcript rows after the punchline.
+    const reactionIndex = lines.findIndex((line, index) => index >= startLineIndex && line.start <= start + 75 && REACTION_MARKER.test(line.text));
+    if (reactionIndex >= 0) {
+      const setupStart = Math.max(0, reactionIndex - 2);
+      if (lines[setupStart].start >= start - 8) start = Math.min(start, lines[setupStart].start);
+      end = Math.max(end, lines[reactionIndex].end);
+    }
+  }
+  if (end - start < 15) {
+    const contextEnd = lines.find((line) => line.end >= start + 15)?.end;
+    if (contextEnd) end = contextEnd;
+  }
+  if (end - start > 75) end = start + 75;
+  if (end > maxTime) {
+    end = maxTime;
+    start = Math.max(0, end - Math.min(75, end - start));
+  }
+  return { ...clip, startTime: timestampString(start), endTime: timestampString(end) };
+}
+
+function normalizeAndLimitPodcastClips(value: unknown, categories: PodcastCategory[], lines: { start: number; end: number; text: string }[], maxTime: number): { clips: any[]; warnings: string[]; categoryCounts: Record<string, number> } {
+  const warnings: string[] = [];
+  const normalized = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const perCategory = new Map<PodcastCategory, any[]>();
+  for (const category of categories) perCategory.set(category, []);
+  for (const raw of normalized) {
+    if (!raw || !raw.startTime || !raw.endTime) continue;
+    const category = CATEGORY_ALIASES[String(raw.category || (categories.length === 1 ? categories[0] : "")).trim().toLowerCase()];
+    if (!category || !categories.includes(category)) continue;
+    const clip = snapPodcastBoundary(normalizeClipTimestamps({ ...raw, category, viralPotential: Math.max(0, Math.min(100, Number(raw.viralPotential) || 0)) }, maxTime), lines, category, maxTime);
+    const start = timestampSeconds(clip.startTime); const end = timestampSeconds(clip.endTime);
+    if (end <= start || end - start > 75) continue;
+    const duplicateKey = `${category}|${start}|${end}`;
+    if (seen.has(duplicateKey)) continue;
+    seen.add(duplicateKey);
+    perCategory.get(category)!.push(clip);
+  }
+  const clips: any[] = [];
+  for (const category of categories) {
+    const candidates = (perCategory.get(category) || []).sort((a, b) => Number(b.viralPotential) - Number(a.viralPotential)).slice(0, 6);
+    if (candidates.length < 6) warnings.push(`${category}: hanya ${candidates.length} kandidat kuat, tidak diisi clip lemah.`);
+    clips.push(...candidates.map((clip, index) => ({ ...clip, id: `${category}-${index + 1}` })));
+  }
+  return { clips, warnings, categoryCounts: Object.fromEntries(categories.map((category) => [category, (perCategory.get(category) || []).length > 6 ? 6 : (perCategory.get(category) || []).length])) };
+}
+
 // Upload video file dari browser → simpan ke temp/uploads dan return path absolut
 app.post("/api/upload-video", upload.single("file"), (req, res) => {
   try {
@@ -262,10 +390,19 @@ function parseObsidianLine(md: string) {
     if (!match) return [];
     const parts = match[1].split(":").map(Number);
     const start = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
-    return [{ start, timeStr: match[1], text: match[2].replace(/^\*{1,2}|\*{1,2}$/g, "").trim() }];
+    return [{ start, timeStr: match[1], text: normalizeTranscriptText(match[2].replace(/^\*{1,2}|\*{1,2}$/g, "")) }];
   });
-  const unique = parsed.filter((item, index) => index === 0 || item.start !== parsed[index - 1].start);
-  return unique.map((cur, index) => ({ start: cur.start, end: unique[index + 1]?.start ?? cur.start + 10, text: cur.text, timeStr: cur.timeStr }));
+  const merged: typeof parsed = [];
+  const indexByStart = new Map<number, number>();
+  for (const item of parsed) {
+    const existingIndex = indexByStart.get(item.start);
+    if (existingIndex !== undefined) merged[existingIndex].text = `${merged[existingIndex].text} ${item.text}`.trim();
+    else {
+      indexByStart.set(item.start, merged.length);
+      merged.push({ ...item });
+    }
+  }
+  return merged.map((cur, index) => ({ start: cur.start, end: merged[index + 1]?.start ?? cur.start + 10, text: cur.text, timeStr: cur.timeStr }));
 }
 
 function extractVideoId(urlOrId: string): string {
@@ -363,10 +500,10 @@ function normalizeFaceTracks(value: unknown): FaceTrackPoint[] {
     .filter((track) => Number.isFinite(track.time) && track.time >= 0 && Number.isFinite(track.x) && Number.isFinite(track.y) && Number.isFinite(track.width) && Number.isFinite(track.height))
     .map((track) => ({
       time: track.time,
-      x: Math.max(0, Math.min(1, track.x)),
-      y: Math.max(0, Math.min(1, track.y)),
       width: Math.max(0, Math.min(1, track.width)),
       height: Math.max(0, Math.min(1, track.height)),
+      x: Math.max(track.width / 2, Math.min(1 - track.width / 2, track.x)),
+      y: Math.max(track.height / 2, Math.min(1 - track.height / 2, track.y)),
     }))
     .sort((a, b) => a.time - b.time);
 }
@@ -413,20 +550,31 @@ async function fetchFaceTracksViaPython(videoPath: string, interval: number = 2)
   throw new Error(`Python tidak ditemukan (tried ${candidates.join(", ")}). Install python deps: pip install opencv-python mediapipe. Detail: ${lastErr}`);
 }
 
-async function transcribeClipViaPython(videoPath: string): Promise<{ captions: { start: number; end: number; text: string }[]; wordCount: number; model: string; device: string }> {
+type WhisperModelChoice = "small" | "medium";
+
+function resolveWhisperModel(modelChoice?: string): { name: WhisperModelChoice; path: string } {
+  const normalized = String(modelChoice || "small").trim().toLowerCase();
+  if (normalized !== "small" && normalized !== "medium") {
+    throw new Error(`Model Whisper tidak dikenal: ${modelChoice}. Pilih small atau medium.`);
+  }
+  const name = normalized as WhisperModelChoice;
+  const modelPath = path.join(process.cwd(), "models", `faster-whisper-${name}`);
+  const requiredFiles = ["config.json", "model.bin", "tokenizer.json"];
+  if (requiredFiles.some((fileName) => !fs.existsSync(path.join(modelPath, fileName)))) {
+    throw new Error(`Model Whisper ${name} belum terpasang. Tambahkan model lokal di ${modelPath} (minimal config.json, model.bin, dan tokenizer.json), lalu coba export lagi.`);
+  }
+  return { name, path: modelPath };
+}
+
+async function transcribeClipViaPython(videoPath: string, modelChoice: WhisperModelChoice = "small"): Promise<{ captions: { start: number; end: number; text: string }[]; wordCount: number; model: string; device: string }> {
   const script = path.join(process.cwd(), "src/python/transcribe_clip.py");
   const candidates = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
   let lastErr = "";
-  const localWhisperModel = path.join(process.cwd(), "models", "faster-whisper-small");
-  const configuredWhisperModel = String(process.env.WHISPER_MODEL || "").trim().replace(/^['"]|['"]$/g, "");
-  const hasLocalSmallModel = fs.existsSync(path.join(localWhisperModel, "config.json"));
-  const whisperModel = configuredWhisperModel && configuredWhisperModel !== '"'
-    ? (configuredWhisperModel.toLowerCase() === "small" && hasLocalSmallModel ? localWhisperModel : configuredWhisperModel)
-    : (hasLocalSmallModel ? localWhisperModel : "small");
+  const whisperModel = resolveWhisperModel(modelChoice);
   for (const exe of candidates) {
     try {
       return await new Promise((resolve, reject) => {
-        const args = [script, videoPath, "--model", whisperModel];
+        const args = [script, videoPath, "--model", whisperModel.path];
         const proc = spawn(exe, args, { shell: false });
         let out = "";
         let err = "";
@@ -691,72 +839,66 @@ app.get("/api/youtube/download-progress/:jobId", (req, res) => {
   res.json(progress);
 });
 
-const slicinClipResponseSchema = {
-  type: "array",
-  minItems: 1,
-  maxItems: 7,
-  items: {
-    type: "object",
-    properties: {
-      id: { type: "string" },
-      startTime: { type: "string" },
-      endTime: { type: "string" },
-      title: { type: "string" },
-      summary: { type: "string" },
-      reason: { type: "string" },
-      transcript_snippet: { type: "string" },
-      caption: { type: "string" },
-      viralPotential: { type: "number", minimum: 0, maximum: 100 },
-    },
-    required: ["id", "startTime", "endTime", "title", "summary", "reason", "transcript_snippet", "caption", "viralPotential"],
-    additionalProperties: false,
-  },
-};
-
 // ---------- API: analyze transcript -> clips via Gemini 3.5 flash lite ----------
 app.post("/api/slicin/analyze", async (req, res) => {
   const { transcript, videoPath, mode, customPrompt, apiKey } = req.body;
+  const analysisMode = mode === "gaming" ? "gaming" : "podcast";
+  const categories = normalizePodcastCategories(req.body.categories, analysisMode);
+  const transcriptLines = Array.isArray(transcript)
+    ? transcriptLinesFromInput(transcript)
+    : typeof transcript === "string"
+      ? transcriptLinesFromInput(parseObsidianLine(transcript))
+      : [];
   // transcript can be string or array of lines
   let plain = "";
   if (Array.isArray(transcript)) {
-    plain = transcript
-      .map((l: any) => {
-        const s = l.start ?? 0;
-        const m = Math.floor(s / 60);
-        const sec = Math.floor(s % 60);
-        const ts = `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    plain = transcriptLines
+      .map((l) => {
+        const ts = timestampString(l.start);
         return `[${ts}] ${l.text}`;
       })
       .join("\n");
   } else if (typeof transcript === "string") {
-    plain = transcript;
+    plain = normalizeTranscriptText(transcript).replace(/\\+([\[\]])/g, "$1");
   }
   if (!plain) return res.status(400).json({ error: "Missing transcript" });
+
+  if (analysisMode === "podcast" && !categories.length) {
+    return res.status(400).json({ error: "Pilih minimal satu kategori podcast: Comedy, Mystery, atau Edukasi." });
+  }
 
   // limit transcript to avoid token overflow (approx 30k chars)
   if (plain.length > 30000) plain = plain.slice(0, 30000) + "\n...[truncated]";
 
   const fileName = videoPath ? path.basename(videoPath) : "youtube-video";
   try {
+    const categoryInstructions = analysisMode === "podcast" ? `
+PODCAST CATEGORIES (return a category on every clip; target up to 6 strong clips per selected category):
+${categories.map((category) => category === "comedy" ? `- comedy: Cari setup, eskalasi, punchline, lalu reaksi. Mulai sebelum punchline, bukan dari baris [tertawa]. Akhiri setelah [tertawa], [berteriak], [bersorak], atau reaksi terdekat. Gunakan payoff jelas. Contoh angle: “gula betes”, “kencing tikus”, rangkaian bantal, “Mamangfron”.` : category === "mystery" ? `- mystery: Cari pertanyaan, hal aneh, mitos, cerita jin/penunggu, atau informasi yang membuat penonton ingin tahu jawabannya. Mulai saat misteri diperkenalkan dan akhiri saat jawaban/reveal. Jangan mengubah mitos menjadi fakta baru.` : `- education: Cari alur mitos/pertanyaan → penjelasan → kesimpulan. Jangan memotong antara pertanyaan dan jawaban. Pertahankan detail agar konteks utuh dan jangan membuat klaim medis/ilmiah baru.`).join("\n")}
+` : "";
+    const categoryExample = analysisMode === "podcast" ? `"category":"${categories[0]}",` : "";
+    const categoryRules = analysisMode === "podcast" ? `- category wajib salah satu dari: ${categories.join(", ")}` : "";
     const prompt = customPrompt || `
-You are an expert viral short-form editor for ${mode === "gaming" ? "Gaming (MOBA HOK/MLBB)" : "Indonesian Podcast (Helmy Yahya style)"}.
+You are an expert viral short-form editor for ${analysisMode === "gaming" ? "Gaming (MOBA HOK/MLBB)" : "Indonesian Podcast (Helmy Yahya style)"}.
 Video: "${fileName}"
 
 TRANSCRIPT WITH TIMESTAMPS:
 ${plain}
 
-Task: Identify 5-7 most viral-worthy segments (15-60 seconds each) for Reels/Shorts/TikTok.
+Task: Identify the strongest short-form segments for Reels/Shorts/TikTok. ${analysisMode === "podcast" ? `Return up to 6 strong clips for EACH selected category (${categories.join(", ")}); do not fill missing slots with weak clips.` : "Return 5-7 segments."}
 For gaming: focus on savage/maniac, lord steal, comeback.
-For podcast: focus on hot takes, emotional punchlines, controversial statements.
+For podcast: preserve the full conversational context, setup, payoff, and reaction. Use transcript timestamp boundaries and do not cut a sentence in half.
+${categoryInstructions}
 
 Return ONLY a valid JSON array, with double-quoted property names. Do not use Markdown fences, backslashes before property names, comments, or trailing commas:
 [
-  {"id":"c1","startTime":"00:01:20","endTime":"00:01:55","title":"Judul Hook","summary":"Ringkasan 1 kalimat","reason":"Alasan viral","transcript_snippet":"cuplikan","caption":"Caption relevan dengan isi clip.\n\n#topik #konteks","viralPotential":92},
+  {"id":"c1",${categoryExample}"startTime":"00:01:20","endTime":"00:01:55","title":"Judul Hook","summary":"Ringkasan 1 kalimat","reason":"Alasan viral","transcript_snippet":"cuplikan","caption":"Caption relevan dengan isi clip.\n\n#topik #konteks","viralPotential":92},
   ...
 ]
 Rules:
-- startTime/endTime must be HH:MM:SS or MM:SS within transcript range
+- startTime/endTime must be HH:MM:SS or MM:SS within transcript range, with 15-75 seconds per podcast clip
 - viralPotential 0-100
+${categoryRules}
 - Indonesian language for title/summary if podcast mode
 - caption wajib berisi 1-2 paragraf pendek dalam bahasa Indonesia yang terdengar seperti ditulis creator, bukan laporan atau ringkasan AI
 - mulai dengan observasi, konflik, atau kalimat yang langsung masuk ke topik clip; jangan mengulang judul sebagai kalimat pertama
@@ -886,7 +1028,7 @@ Rules:
 
     const structuredConfig = {
       responseMimeType: "application/json",
-      responseJsonSchema: slicinClipResponseSchema,
+      responseJsonSchema: buildSlicinClipResponseSchema(analysisMode, categories),
       temperature: 0.2,
     };
     const readText = (response: any) => response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -917,7 +1059,8 @@ Rules:
       console.error("JSON parse failed raw:", text.slice(0, 2000));
       // One deterministic repair request covers models that ignore the schema
       // after a transient safety/formatting response.
-      const retryPrompt = `${prompt}\n\nYour previous response was not valid JSON. Return the same result again as ONLY a JSON array. Use exactly these keys: id, startTime, endTime, title, summary, reason, transcript_snippet, caption, viralPotential. Do not escape underscores or brackets with backslashes.`;
+      const retryKeys = analysisMode === "podcast" ? "id, category, startTime, endTime, title, summary, reason, transcript_snippet, caption, viralPotential" : "id, startTime, endTime, title, summary, reason, transcript_snippet, caption, viralPotential";
+      const retryPrompt = `${prompt}\n\nYour previous response was not valid JSON. Return the same result again as ONLY a JSON array. Use exactly these keys: ${retryKeys}. Do not escape underscores or brackets with backslashes.`;
       const retryText = await generate(retryPrompt);
       const retryJson = extractJsonArray(retryText);
       if (!retryJson) throw new Error(`Gagal parse JSON dari Gemini: ${parseErr.message}. Retry juga tidak mengembalikan array JSON.`);
@@ -935,14 +1078,18 @@ Rules:
       else throw new Error(`AI JSON bukan array: ${JSON.stringify(clips).slice(0, 500)}`);
     }
 
-    const maxTranscriptTime = Array.isArray(transcript)
-      ? Math.max(...transcript.map((line: any) => Number(line.start) || 0), 0) + 10
+    const maxTranscriptTime = transcriptLines.length
+      ? Math.max(...transcriptLines.map((line) => line.end), 0)
       : Number.POSITIVE_INFINITY;
-    clips = clips
-      .filter((clip: any) => clip && clip.startTime && clip.endTime)
-      .map((clip: any) => normalizeClipTimestamps(clip, maxTranscriptTime));
-
-    res.json({ clips, model: GEMINI_MODEL });
+    if (analysisMode === "podcast") {
+      const limited = normalizeAndLimitPodcastClips(clips, categories, transcriptLines, maxTranscriptTime);
+      res.json({ clips: limited.clips, model: GEMINI_MODEL, categories, targetPerCategory: 6, categoryCounts: limited.categoryCounts, warnings: limited.warnings });
+    } else {
+      clips = clips
+        .filter((clip: any) => clip && clip.startTime && clip.endTime)
+        .map((clip: any) => normalizeClipTimestamps(clip, maxTranscriptTime));
+      res.json({ clips, model: GEMINI_MODEL });
+    }
   } catch (e: any) {
     console.error("Gemini error", e);
     res.status(500).json({ error: e.message, model: GEMINI_MODEL, hint: "Analyze sekarang memakai JSON schema, repair escape ilegal, dan retry otomatis. Jika tetap gagal, cek model/API key atau kurangi panjang transcript." });
@@ -1161,7 +1308,7 @@ function buildXExpr(tracks: FaceTrackPoint[], sSec: number, eSec: number): strin
 
 // ---------- Cut with aspect + smart crop sampling (dynamic per 2s follows face) ----------
 app.post("/api/slicin/cut", async (req, res) => {
-  const { videoPath, startTime, endTime, outputName, aspectRatio, smartCrop, faceTracks, sampleInterval, version, title, caption, subtitleLines, burnCaptions, captionEngine, sourceName, sourceUrl } = req.body;
+  const { videoPath, startTime, endTime, outputName, aspectRatio, smartCrop, faceTracks, sampleInterval, version, title, caption, subtitleLines, burnCaptions, captionEngine, whisperModel, sourceName, sourceUrl } = req.body;
   const ffmpegPath = process.env.FFMPEG_PATH || "";
   if (!videoPath || !startTime || !endTime) return res.status(400).json({ error: "Missing required parameters" });
   const ver = Number(version) || 3; // 1=hijau, 2=hijau+posisi, 3=bersih per-frame
@@ -1198,6 +1345,12 @@ app.post("/api/slicin/cut", async (req, res) => {
     const interval = Number.isFinite(requestedInterval) ? Math.max(0.2, Math.min(2, requestedInterval)) : 0.25;
     const preparedFaceTracks = smoothFaceTracks(faceTracks);
     const useWhisperCaptions = Boolean(burnCaptions && captionEngine === "whisper");
+    const requestedWhisperModel = String(whisperModel || "small").trim().toLowerCase();
+    if (requestedWhisperModel !== "small" && requestedWhisperModel !== "medium") {
+      return res.status(400).json({ error: `Model Whisper tidak dikenal: ${whisperModel}. Pilih small atau medium.` });
+    }
+    const selectedWhisperModel = requestedWhisperModel as WhisperModelChoice;
+    if (useWhisperCaptions) resolveWhisperModel(selectedWhisperModel);
     const subtitleAss = burnCaptions && !useWhisperCaptions ? buildSectionSubtitleAss(subtitleLines, sSec, eSec) : null;
     if (subtitleAss) {
       subtitlePath = path.join(CLIP_DIR, `_sub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.ass`);
@@ -1208,7 +1361,7 @@ app.post("/api/slicin/cut", async (req, res) => {
       : videoFilter;
     const finalizeCaptionedOutput = async () => {
       if (!useWhisperCaptions) return outputPath;
-      const transcript = await transcribeClipViaPython(outputPath);
+      const transcript = await transcribeClipViaPython(outputPath, selectedWhisperModel);
       const whisperAss = buildSectionSubtitleAss(transcript.captions, 0, duration);
       if (!whisperAss) throw new Error("Whisper tidak menghasilkan caption yang bisa ditampilkan");
       subtitlePath = path.join(CLIP_DIR, `_whisper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.ass`);

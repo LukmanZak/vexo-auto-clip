@@ -29,7 +29,7 @@ Daftar endpoint:
 | # | Method & Path | Fungsi | Dipakai di UI? |
 |---|---------------|--------|----------------|
 | 1 | `POST /api/slicin/parse-obsidian` | Parse markdown Obsidian Web Clipper → array baris transcript | Tombol "Parse transcript" (validasi server; frontend juga punya parser lokal `src/lib/obsidianParser.ts`) |
-| 2 | `POST /api/slicin/analyze` | **Inti Context Slicer.** Kirim transcript → Gemini (`gemini-3.5-flash-lite`) → 5–7 kandidat clip + caption | Tombol "Analyze transcript" (`analyze()` di `SlicinView.tsx:254`) |
+| 2 | `POST /api/slicin/analyze` | **Inti Context Slicer.** Kirim transcript → Gemini (`gemini-3.5-flash-lite`) → kandidat clip berkonteks + caption (Podcast maksimal 6 per kategori) | Tombol "Analyze transcript" (`analyze()` di `SlicinView.tsx`) |
 | 3 | `POST /api/slicin/process` | **Legacy.** Versi lama analyze, output minimal. Sekarang hanya wrapper yang mewajibkan `transcript` | Tidak dipakai frontend aktif; dipertahankan untuk kompatibilitas |
 | 4 | `POST /api/slicin/thumbnail` | Ambil 1 frame JPEG pada detik `time` via ffmpeg, kembalikan `thumbPath` + `dataUrl` base64 | Utilitas preview (tidak ada tombol di `SlicinView` saat ini) |
 | 5 | `POST /api/slicin/cut` | **Export.** Potong video (`startTime–endTime`), crop aspect ratio, opsional smart-crop face-follow + burn caption, tulis file `.md` caption | `exportClip()` / `exportSelected()` (`SlicinView.tsx:325,433`), dipanggil 1–2× per clip saat smart-crop aktif |
@@ -76,9 +76,9 @@ Aturan:
 - Timestamp boleh `MM:SS` (`0:03`) atau `HH:MM:SS` (`00:01:20`), boleh dibungkus `**`, `[]`, bullet `-`/`*`.
 - Pemisah timestamp–teks boleh `·`, `-`, `–`, `—`, `|`, atau spasi.
 - Baris tanpa timestamp (deskripsi video, link sosmed, heading) **diabaikan**.
-- Timestamp duplikat berurutan dibuang (satu dipertahankan).
+- Timestamp duplikat berurutan digabung dan seluruh teksnya dipertahankan, termasuk marker reaksi seperti `[tertawa]`.
 - `end` = `start` baris berikutnya; baris terakhir `end = start + 10`.
-- Markup `**` di ujung teks dibersihkan.
+- Markup `**` di ujung teks dibersihkan; escape Markdown `\\[tertawa\\]` dinormalisasi menjadi `[tertawa]`.
 
 ### 2.3. Format timestamp clip (`startTime` / `endTime`)
 
@@ -91,7 +91,7 @@ String `MM:SS` atau `HH:MM:SS`, mis. `"00:01:20"`, `"01:55"`, `"00:00:00"`. Fung
 | `GEMINI_API_KEY` | `.env` / env | `/analyze`, `/process` (atau `apiKey` per-request dari `ApiKeyContext` frontend) |
 | `GEMINI_MODEL` | env, default `"gemini-3.5-flash-lite"` (`server.ts:35`) | `/analyze`, `/process` |
 | `FFMPEG_PATH` | env, default `""` → mengandalkan `ffmpeg` di PATH (`server.ts:1157`, `runFfmpegCommand`) | `/thumbnail`, `/cut` (butuh build ffmpeg dengan `libx264`, `aac`, dan `libass` untuk burn caption non-Whisper) |
-| `WHISPER_MODEL` | env, default folder lokal `models/faster-whisper-small` bila `config.json` ada, else `"small"` (`server.ts`) | `/cut` hanya bila `burnCaptions=true` + `captionEngine="whisper"` (via `src/python/transcribe_clip.py`, butuh `faster-whisper`) |
+| `WHISPER_MODEL` | env untuk pemanggilan langsung `src/python/transcribe_clip.py`; UI/API memakai model lokal yang dipilih | `/cut` hanya bila `burnCaptions=true` + `captionEngine="whisper"` (via `src/python/transcribe_clip.py`, butuh `faster-whisper`) |
 | Direktori `temp/thumbs`, `temp/clips` | dibuat otomatis (`server.ts:39-48`) | output thumbnail & clip |
 | `@google/genai` (`GoogleGenAI`) | `package.json` | `/analyze`, `/process` |
 
@@ -162,7 +162,7 @@ curl -s http://localhost:3333/api/slicin/parse-obsidian \
 
 **Definisi:** `server.ts:709`. **Frontend:** `SlicinView.analyze()` (`SlicinView.tsx:254`) → `fetch("/api/slicin/analyze", ...)`.
 
-Menerima transcript (string atau array), memotongnya maks ~30.000 karakter, membangun prompt editor viral, memanggil Gemini dengan JSON schema terstruktur, me-repair JSON bila perlu (termasuk 1× retry otomatis), menormalisasi timestamp, dan mengembalikan 1–7 kandidat clip.
+Menerima transcript (string atau array), memotongnya maks ~30.000 karakter, membangun prompt editor viral, memanggil Gemini dengan JSON schema terstruktur, me-repair JSON bila perlu (termasuk 1× retry otomatis), menormalisasi boundary transcript, lalu mengembalikan kandidat clip. Podcast diproses sebagai satu konteks utuh dan menghasilkan maksimal 6 clip kuat per kategori terpilih.
 
 ### 4.1. Request
 
@@ -179,6 +179,7 @@ Content-Type: application/json
   ],
   "videoPath": "C:/codingan/vexo/temp/downloads/HYwS8HAzwRs_720_....mp4",
   "mode": "podcast",
+  "categories": ["comedy", "education"],
   "customPrompt": "string opsional — bila diisi, menggantikan prompt bawaan",
   "apiKey": "string opsional — API key per-request, menimpa server key"
 }
@@ -189,6 +190,7 @@ Content-Type: application/json
 | `transcript` | `string \| TranscriptLine[]` | Ya | Bila array: tiap item minimal `{start, text}`; server memformat ulang jadi `[MM:SS] teks` per baris (detik → `MM:SS`, tanpa jam). Bila string: dipakai apa adanya. Kosong → `400 Missing transcript`. |
 | `videoPath` | `string` | Tidak | Hanya dipakai untuk nama file di prompt (`Video: "<basename>"`). Tidak dibaca/divalidasi di endpoint ini. Frontend wajib sudah mengisinya sebelum Analyze (kalau kosong, UI menolak dengan "Download video YouTube dulu"). |
 | `mode` | `"podcast" \| "gaming"` | Tidak (default `"podcast"`) | Mengubah persona prompt: `podcast` = "Indonesian Podcast (Helmy Yahya style)", fokus hot takes/punchline/kontroversi; `gaming` = "Gaming (MOBA HOK/MLBB)", fokus savage/maniac/lord steal/comeback. Bahasa title/summary Indonesia untuk mode podcast. |
+| `categories` | `("comedy" \| "mystery" \| "education")[]` | Wajib untuk Podcast UI | Multi-select kategori Podcast. Alias `komedi`, `misteri`, `edukasi` dinormalisasi; kategori invalid dibuang. Jika client lama tidak mengirim field ini, server fallback ke `["comedy"]`. Gaming mengabaikannya. Target maksimal 6 clip kuat per kategori, tanpa filler lemah. |
 | `customPrompt` | `string` | Tidak | Prompt mentah pengganti. Bila diisi, `mode`/`videoPath` diabaikan kecuali disisipkan manual. |
 | `apiKey` | `string` | Tidak | Bila diisi, request ini memakai `new GoogleGenAI({apiKey})`; bila kosong memakai server `genAI` (`.env GEMINI_API_KEY`). Frontend mengisi dari `ApiKeyContext.effectiveApiKey`. |
 
@@ -197,14 +199,14 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
 ### 4.2. Apa yang dipakai/dilakukan server (berurutan)
 
 1. **Serialisasi transcript** (`server.ts:713-725`): array → string `[MM:SS] teks` join newline.
-2. **Prompt bawaan** (`server.ts:733-765`): persona + nama file + transcript + tugas "Identify 5-7 most viral-worthy segments (15-60 seconds each)" + contoh JSON + rules caption Indonesia (1–2 paragraf gaya creator, tanpa emoji, maks 5 hashtag relevan, larangan jargon/klaim baru, escape `\n`, tanpa fence markdown).
-3. **JSON schema terstruktur** `slicinClipResponseSchema` (`server.ts:686`): array `minItems:1, maxItems:7`, tiap item wajib `id, startTime, endTime, title, summary, reason, transcript_snippet, caption, viralPotential (0–100)`, `additionalProperties:false`.
+2. **Prompt bawaan** (`server.ts`): satu prompt gabungan untuk semua kategori terpilih. Comedy mempertahankan setup → punchline → reaksi; Mystery mempertahankan pertanyaan/mitos → reveal; Edukasi mempertahankan pertanyaan → penjelasan → kesimpulan. Target durasi Podcast 15–75 detik, batas mengikuti timestamp transcript, caption natural Bahasa Indonesia tanpa emoji/em dash.
+3. **JSON schema terstruktur** dibangun dinamis: Podcast mewajibkan `category` sesuai kategori terpilih dan `maxItems = jumlah kategori × 6`; Gaming tetap schema lama maksimal 7 item.
 4. **Panggil Gemini 3 lapis fallback** (`server.ts:885-897`): (a) `responseMimeType: application/json + responseJsonSchema + temperature:0.2` → (b) `responseMimeType: application/json` → (c) plain. Model dari `GEMINI_MODEL`.
 5. **Ekstraksi array JSON** `extractJsonArray()` (`server.ts:770`): buang fence ```` ```json ````, scan bracket `[…]` dengan state string/escape.
 6. **Repair sintaks** `repairJsonSyntax()` (`server.ts:798`): perbaiki key ter-escape (`\_reason":` → `"reason":`), quote keriting, escape ilegal, newline mentah → `\n`, hapus trailing comma. Dicoba via `tryParseClips()` (`server.ts:853`).
 7. **1× retry deterministik** (`server.ts:908-921`): bila parse gagal, kirim prompt yang sama + instruksi "Return the same result again as ONLY a JSON array..." lalu parse lagi.
 8. **Normalisasi bentuk** (`server.ts:923-928`): bila object `{clips:[...]}` → ambil isinya; bila object tunggal → bungkus `[obj]`.
-9. **Normalisasi timestamp** `normalizeClipTimestamps()` (`server.ts:155`): perbaiki kesalahan umum Gemini `10:15:00` (dimaksud 10 mnt 15 dtk) bila `raw > maxTranscriptTime+30` tapi versi menit ≤ `max+10`; output selalu dinormalisasi via `timestampString()` (`MM:SS` atau `HH:MM:SS` bila ≥1 jam). `maxTranscriptTime` = max `start` transcript + 10 (bila array), else tak hingga.
+9. **Normalisasi boundary**: timestamp di-clamp ke transcript, start di-snap ke awal baris, end ke batas baris berikutnya. Comedy dapat diperluas maksimal dua baris/8 detik ke setup dan sampai marker reaksi terdekat, tetap maksimal 75 detik. Duplikat identik di kategori yang sama dibuang; overlap antar kategori tetap boleh bila angle berbeda. Hasil diurutkan skor dan dipotong maksimal 6 per kategori. Warning dikirim bila kategori hanya memiliki kandidat kuat kurang dari enam.
 
 ### 4.3. Response sukses (`200`)
 
@@ -213,6 +215,7 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
   "clips": [
     {
       "id": "c1",
+      "category": "comedy",
       "startTime": "00:01:20",
       "endTime": "00:01:55",
       "title": "Judul Hook",
@@ -223,13 +226,18 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
       "viralPotential": 92
     }
   ],
-  "model": "gemini-3.5-flash-lite"
+  "model": "gemini-3.5-flash-lite",
+  "categories": ["comedy", "education"],
+  "targetPerCategory": 6,
+  "categoryCounts": {"comedy": 2, "education": 3},
+  "warnings": []
 }
 ```
 
 | Field clip | Tipe | Keterangan |
 |------------|------|------------|
 | `id` | `string` | Mis. `"c1"` |
+| `category` | `"comedy" \| "mystery" \| "education"` | Wajib pada clip Podcast; diabaikan pada Gaming. |
 | `startTime`, `endTime` | `string` | Sudah dinormalisasi (`MM:SS`/`HH:MM:SS`), dalam rentang transcript |
 | `title` | `string` | Judul hook (Indonesia bila podcast) |
 | `summary` | `string` | Ringkasan 1 kalimat |
@@ -238,6 +246,10 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
 | `caption` | `string` | 1–2 paragraf pendek gaya creator + ≤5 hashtag relevan, tanpa emoji |
 | `viralPotential` | `number 0–100` | Skor viralitas |
 | Top-level `model` | `string` | Model yang dipakai (`GEMINI_MODEL`) |
+| Top-level `categories` | `string[]` | Kategori Podcast yang dipakai; Gaming mengembalikan tanpa kategori. |
+| Top-level `targetPerCategory` | `number` | Selalu `6` untuk Podcast. |
+| Top-level `categoryCounts` | `Record<string, number>` | Jumlah kandidat kuat setelah dedupe dan limit. |
+| Top-level `warnings` | `string[]` | Catatan bila kategori tidak memiliki enam kandidat kuat; tidak ada filler lemah. |
 
 Frontend lalu: `setClips`, pilih semua (`setSelectedIds`), pindah ke Step 2/3 (`SlicinView.tsx:278-282`).
 
@@ -358,6 +370,7 @@ Hasil selalu tersimpan di `temp/clips/` dan bisa diakses via static `/temp/clips
   "subtitleLines": [{ "start": 80, "end": 85, "text": "kalimat..." }],
   "burnCaptions": false,
   "captionEngine": "whisper",
+  "whisperModel": "small",
   "sourceName": "Nama channel / file",
   "sourceUrl": "https://www.youtube.com/watch?v=..."
 }
@@ -378,6 +391,7 @@ Hasil selalu tersimpan di `temp/clips/` dan bisa diakses via static `/temp/clips
 | `subtitleLines` | `TranscriptLine[]` | Tidak | `[]` | Hanya dipakai bila `burnCaptions=true` **dan** `captionEngine != "whisper"` → dibuat file `.ass` sementara (style Arial 44, 720×1280, alignment bawah-tengah) lalu diburn via filter `subtitles`. |
 | `burnCaptions` | `boolean` | Tidak | `false` | `true` = bakar subtitle ke video. Dua jalur: (a) `captionEngine="whisper"` → transcribe ulang hasil potongan via Python faster-whisper lalu burn; (b) lainnya → burn dari `subtitleLines`. Butuh ffmpeg `libass` untuk jalur (b). |
 | `captionEngine` | `string` | Tidak | — | Hanya nilai `"whisper"` yang spesial (mengaktifkan jalur Whisper). Nilai lain/blank → jalur `.ass` dari `subtitleLines`. |
+| `whisperModel` | `"small"` atau `"medium"` | Tidak | `"small"` | Dipakai saat `burnCaptions=true` dan `captionEngine="whisper"`. Model dipetakan ke folder lokal `models/faster-whisper-small` atau `models/faster-whisper-medium`; jika `config.json` tidak ada, export gagal dengan pesan instalasi yang jelas. |
 | `sourceName`, `sourceUrl` | `string` | Tidak | — | Ditulis ke file `.md` dan footer caption. Frontend mengisi dari info download YouTube / nama file upload. |
 
 Dua pola pemanggilan frontend (smart-crop aktif, `SlicinView.tsx:340-419`):
@@ -424,7 +438,7 @@ Efek samping file: MP4 di `temp/clips/`, `.md` caption di `temp/clips/`, file `.
   - `original`/lain → `scale=1280:720`
 - **Per-frame smooth** (prioritas bila `smartCrop && tracks≥2 && aspect≠original/16:9 && durasi>interval`): bangun ekspresi `x(t)` interpolasi smoothstep antar sampel (downsample ≤96 titik, `<8000` char) → 1 perintah ffmpeg dengan `crop=...*(<xExpr>)...`. Gagal → jatuh ke segmented.
 - **Segmented fallback**: potong per `interval` detik dengan crop per-segmen (posisi = interpolasi tengah segmen), lalu concat re-encode (`concat` demuxer + `setpts`, `aresample`).
-- **Whisper caption** (`burnCaptions && captionEngine==="whisper"`): setelah render utama, `transcribe_clip.py` → `.ass` → pass ffmpeg kedua (`_captioned.mp4`).
+- **Whisper caption** (`burnCaptions && captionEngine==="whisper"`): setelah render utama, model yang dipilih (`whisperModel`, default `small`) dijalankan melalui `transcribe_clip.py` → `.ass` → pass ffmpeg kedua (`_captioned.mp4`).
 - Audio selalu: `-map 0:v:0 -map 0:a:0? -af aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS`.
 
 ### 7.4. Error
@@ -458,7 +472,7 @@ curl -s http://localhost:3333/api/slicin/cut \
 |--------|-----|
 | `server.ts:251` `parseObsidianLine()` | Parser markdown server |
 | `server.ts:137-165` `timestampSeconds/timestampString/normalizeClipTimestamps` | Konversi & repair timestamp clip |
-| `server.ts:686` `slicinClipResponseSchema` | JSON schema Gemini analyze |
+| `server.ts` `buildSlicinClipResponseSchema()` | JSON schema Gemini analyze; dinamis menurut mode dan kategori |
 | `server.ts:453,709,945,983,1155` | Definisi 5 endpoint |
 | `server.ts:103-135` `safeFilePart/cleanCaption/buildSourceAttribution` | Sanitasi caption & nama file |
 | `server.ts:185,208` `runFfmpegCommand/assertValidVideoOutput` | Eksekusi & validasi ffmpeg |

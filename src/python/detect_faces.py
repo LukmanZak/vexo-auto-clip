@@ -6,6 +6,18 @@ def _clamp(value, low=0.0, high=1.0):
     return float(max(low, min(high, value)))
 
 
+def _point(cx, cy, width, height):
+    """Return a normalized center/size point whose box stays inside the frame."""
+    width = _clamp(width)
+    height = _clamp(height)
+    return {
+        "x": _clamp(cx, width / 2.0, 1.0 - width / 2.0),
+        "y": _clamp(cy, height / 2.0, 1.0 - height / 2.0),
+        "width": width,
+        "height": height,
+    }
+
+
 def _track_from_landmarks(landmarks):
     if not landmarks:
         return {"x": 0.5, "y": 0.5, "width": 0.0, "height": 0.0}
@@ -15,12 +27,7 @@ def _track_from_landmarks(landmarks):
     max_y = _clamp(max(point.y for point in landmarks))
     width = _clamp(max_x - min_x)
     height = _clamp(max_y - min_y)
-    return {
-        "x": _clamp((min_x + max_x) / 2),
-        "y": _clamp((min_y + max_y) / 2),
-        "width": width,
-        "height": height,
-    }
+    return _point((min_x + max_x) / 2, (min_y + max_y) / 2, width, height)
 
 
 def _fill_missing_tracks(tracks):
@@ -101,7 +108,7 @@ def detect_with_mediapipe(video_path, interval=2.0):
                     if best:
                         cx = best.xmin + best.width/2
                         cy = best.ymin + best.height/2
-                        tracks.append({"time": t, "x": _clamp(cx), "y": _clamp(cy), "width": _clamp(best.width), "height": _clamp(best.height)})
+                        tracks.append({"time": t, **_point(cx, cy, best.width, best.height)})
                     else:
                         tracks.append({"time": t, "x": 0.5, "y": 0.5, "width": 0, "height": 0})
                 else:
@@ -167,7 +174,7 @@ def detect_with_blaze_face_model(video_path, interval=2.0):
                     _, left, top, width, height = max(boxes, key=lambda item: item[0])
                     width = _clamp(width)
                     height = _clamp(height)
-                    point = {"x": _clamp(left + width / 2), "y": _clamp(top + height / 2), "width": width, "height": height}
+                    point = _point(left + width / 2, top + height / 2, width, height)
             tracks.append({"time": t, **point})
             t += interval
     cap.release()
@@ -259,7 +266,7 @@ def detect_with_haar(video_path, interval=2.0):
             cx = (x + fw/2) / w
             cy = (y + fh/2) / h
             nw = fw / w
-            tracks.append({"time": t, "x": _clamp(cx), "y": _clamp(cy), "width": _clamp(nw), "height": _clamp(fh / h)})
+            tracks.append({"time": t, **_point(cx, cy, nw, fh / h)})
         else:
             tracks.append({"time": t, "x": 0.5, "y": 0.5, "width": 0, "height": 0})
         t += interval
@@ -286,22 +293,22 @@ if __name__ == "__main__":
     try:
         engine = "mediapipe"
         try:
-            tracks = detect_with_blaze_face_model(vp, interval)
-            engine = "blaze-face-tflite"
-        except Exception as e_blaze:
+            tracks = detect_with_tasks_face_landmarker(vp, interval)
+            engine = "mediapipe-tasks-face-landmarker"
+        except Exception as e_tasks:
             try:
-                tracks = detect_with_mediapipe(vp, interval)
-                engine = "mediapipe-blaze"
-            except Exception as e_mediapipe:
+                tracks = detect_with_blaze_face_model(vp, interval)
+                engine = "blaze-face-tflite"
+            except Exception as e_blaze:
                 try:
-                    tracks = detect_with_tasks_face_landmarker(vp, interval)
-                    engine = "mediapipe-tasks"
-                except Exception as e_tasks:
+                    tracks = detect_with_mediapipe(vp, interval)
+                    engine = "mediapipe-blaze"
+                except Exception as e_mediapipe:
                     try:
                         tracks = detect_with_haar(vp, interval)
                         engine = "haar"
                     except Exception as e_haar:
-                        raise RuntimeError(f"BlazeFace TFLite gagal: {e_blaze}; MediaPipe solutions gagal: {e_mediapipe}; MediaPipe Tasks gagal: {e_tasks}; Haar gagal: {e_haar}")
+                        raise RuntimeError(f"MediaPipe Tasks gagal: {e_tasks}; BlazeFace TFLite gagal: {e_blaze}; MediaPipe solutions gagal: {e_mediapipe}; Haar gagal: {e_haar}")
         tracks = _fill_missing_tracks(tracks)
         detected_count = sum(1 for track in tracks if float(track.get("width", 0)) > 0)
         print(json.dumps({
@@ -309,6 +316,7 @@ if __name__ == "__main__":
             "count": len(tracks),
             "detectedCount": detected_count,
             "engine": engine,
+            "interval": interval,
         }))
     except Exception as e:
         print(json.dumps({"error": str(e)})); sys.exit(1)

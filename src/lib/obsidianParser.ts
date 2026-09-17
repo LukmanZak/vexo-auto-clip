@@ -14,17 +14,32 @@ export function parseObsidianMarkdown(md: string): TranscriptLine[] {
   for (const rawLine of md.split(/\r?\n/)) {
     const match = rawLine.match(timestamp);
     if (!match) continue;
-    const text = match[2].replace(/^\*{1,2}|\*{1,2}$/g, "").trim();
+    const text = match[2]
+      .replace(/^\*{1,2}|\*{1,2}$/g, "")
+      // Obsidian/Markdown exports sometimes escape reaction markers. Keep the
+      // marker itself because it is useful structure for comedy boundaries.
+      .replace(/\\+([\[\]])/g, "$1")
+      .trim();
     if (!text) continue;
     parsed.push({ text, startSec: timeToSeconds(match[1]) });
   }
 
-  // Keep source order but ignore duplicate timestamps commonly produced by
-  // copied headings. The next timestamp is the most useful segment boundary.
-  const unique = parsed.filter((item, index) => index === 0 || item.startSec !== parsed[index - 1].startSec);
-  return unique.map((cur, index) => ({
+  // Keep every row. Obsidian can emit multiple rows at the same second and
+  // dropping the later row loses setup/punchline/reaction markers. Merge only
+  // the timestamp, preserving all text in source order.
+  const merged: { text: string; startSec: number }[] = [];
+  const indexByStart = new Map<number, number>();
+  for (const item of parsed) {
+    const existingIndex = indexByStart.get(item.startSec);
+    if (existingIndex !== undefined) merged[existingIndex].text = `${merged[existingIndex].text} ${item.text}`.trim();
+    else {
+      indexByStart.set(item.startSec, merged.length);
+      merged.push({ ...item });
+    }
+  }
+  return merged.map((cur, index) => ({
     start: cur.startSec,
-    end: unique[index + 1]?.startSec ?? cur.startSec + 10,
+    end: merged[index + 1]?.startSec ?? cur.startSec + 10,
     text: cur.text,
   }));
 }
