@@ -206,7 +206,7 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
 6. **Repair sintaks** `repairJsonSyntax()` (`server.ts:798`): perbaiki key ter-escape (`\_reason":` → `"reason":`), quote keriting, escape ilegal, newline mentah → `\n`, hapus trailing comma. Dicoba via `tryParseClips()` (`server.ts:853`).
 7. **1× retry deterministik** (`server.ts:908-921`): bila parse gagal, kirim prompt yang sama + instruksi "Return the same result again as ONLY a JSON array..." lalu parse lagi.
 8. **Normalisasi bentuk** (`server.ts:923-928`): bila object `{clips:[...]}` → ambil isinya; bila object tunggal → bungkus `[obj]`.
-9. **Normalisasi boundary**: timestamp di-clamp ke transcript, start di-snap ke awal baris, end ke batas baris berikutnya. Comedy dapat diperluas maksimal dua baris/8 detik ke setup dan sampai marker reaksi terdekat, tetap maksimal 75 detik. Duplikat identik di kategori yang sama dibuang; overlap antar kategori tetap boleh bila angle berbeda. Hasil diurutkan skor dan dipotong maksimal 6 per kategori. Warning dikirim bila kategori hanya memiliki kandidat kuat kurang dari enam.
+9. **Normalisasi boundary dan validasi Comedy**: timestamp di-clamp ke transcript, start di-snap ke awal baris, end ke batas baris berikutnya. Comedy dapat diperluas maksimal dua baris/8 detik ke setup dan sampai marker reaksi terdekat, tetap maksimal 75 detik. Kandidat Comedy wajib memiliki minimal dua marker reaksi dan minimal satu `[tertawa]` bila transcript menyediakan marker tersebut, serta minimal dua baris dialog yang nyata. Kandidat informatif tanpa payoff komedi dibuang. Kandidat Comedy diurutkan berdasarkan kepadatan reaksi per detik lalu `viralPotential`; overlap berlebihan dalam kategori yang sama dibuang, sedangkan overlap antar kategori tetap boleh bila angle berbeda. Hasil dipotong maksimal 6 per kategori. Warning dikirim bila kandidat dibuang atau kategori hanya memiliki kandidat kuat kurang dari enam.
 
 ### 4.3. Response sukses (`200`)
 
@@ -249,7 +249,7 @@ Batas transcript: bila `plain.length > 30000`, dipotong + suffix `\n...[truncate
 | Top-level `categories` | `string[]` | Kategori Podcast yang dipakai; Gaming mengembalikan tanpa kategori. |
 | Top-level `targetPerCategory` | `number` | Selalu `6` untuk Podcast. |
 | Top-level `categoryCounts` | `Record<string, number>` | Jumlah kandidat kuat setelah dedupe dan limit. |
-| Top-level `warnings` | `string[]` | Catatan bila kategori tidak memiliki enam kandidat kuat; tidak ada filler lemah. |
+| Top-level `warnings` | `string[]` | Catatan bila kandidat Comedy tidak memiliki reaksi/setup yang cukup atau kategori tidak memiliki enam kandidat kuat; tidak ada filler lemah. |
 
 Frontend lalu: `setClips`, pilih semua (`setSelectedIds`), pindah ke Step 2/3 (`SlicinView.tsx:278-282`).
 
@@ -479,6 +479,7 @@ curl -s http://localhost:3333/api/slicin/cut \
 | `server.ts` `transcribeClipViaPython()` | Whisper lokal (`src/python/transcribe_clip.py`, model `models/faster-whisper-small` / `WHISPER_MODEL`) |
 | `server.ts:1044-1152` `smoothFaceTracks/buildTrackExpr/buildXExpr` | Smoothing & ekspresi face-follow |
 | `src/components/SlicinView.tsx` | UI 3-step + semua pemanggilan `fetch` |
+| `src/lib/comedySelection.ts` | Penghitungan marker reaksi, validasi setup/dialog, dan ranking kepadatan reaksi Comedy |
 | `src/lib/obsidianParser.ts` | Parser lokal + `TranscriptLine`, `timeToSeconds`, `secondsToTime` |
 | `src/example_obsidian/obs.md` | Contoh transcript realistis (Helmy Yahya, 1266 baris) |
 | `src/context/ApiKeyContext.tsx` | `effectiveApiKey` → field `apiKey` di `/analyze` |

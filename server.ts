@@ -6,6 +6,14 @@ import fs from "fs";
 import dotenv from "dotenv";
 import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
+import {
+  countComedyReactionMarkers,
+  countLaughMarkers,
+  getComedyReactionStats,
+  isStrongComedyCandidate,
+  rankComedyCandidates,
+  type ComedyReactionStats,
+} from "./src/lib/comedySelection";
 
 dotenv.config();
 
@@ -253,7 +261,7 @@ function snapPodcastBoundary(clip: any, lines: { start: number; end: number; tex
   if (category === "comedy") {
     // Keep searching to the nearest reaction inside the 75-second clip cap;
     // reaction markers are often a few transcript rows after the punchline.
-    const reactionIndex = lines.findIndex((line, index) => index >= startLineIndex && line.start <= start + 75 && REACTION_MARKER.test(line.text));
+    const reactionIndex = lines.findIndex((line, index) => index >= startLineIndex && line.start >= start && line.start <= start + 75 && REACTION_MARKER.test(line.text));
     if (reactionIndex >= 0) {
       const setupStart = Math.max(0, reactionIndex - 2);
       if (lines[setupStart].start >= start - 8) start = Math.min(start, lines[setupStart].start);
@@ -276,7 +284,10 @@ function normalizeAndLimitPodcastClips(value: unknown, categories: PodcastCatego
   const warnings: string[] = [];
   const normalized = Array.isArray(value) ? value : [];
   const seen = new Set<string>();
-  const perCategory = new Map<PodcastCategory, any[]>();
+  type PodcastCandidate = { clip: any; stats?: ComedyReactionStats };
+  const perCategory = new Map<PodcastCategory, PodcastCandidate[]>();
+  const transcriptHasLaugh = countLaughMarkers(lines) > 0;
+  let comedyRejected = 0;
   for (const category of categories) perCategory.set(category, []);
   for (const raw of normalized) {
     if (!raw || !raw.startTime || !raw.endTime) continue;
@@ -288,15 +299,32 @@ function normalizeAndLimitPodcastClips(value: unknown, categories: PodcastCatego
     const duplicateKey = `${category}|${start}|${end}`;
     if (seen.has(duplicateKey)) continue;
     seen.add(duplicateKey);
-    perCategory.get(category)!.push(clip);
+    const stats = category === "comedy" ? getComedyReactionStats(lines, start, end) : undefined;
+    if (category === "comedy" && (!stats || !isStrongComedyCandidate(stats, transcriptHasLaugh))) {
+      comedyRejected += 1;
+      continue;
+    }
+    perCategory.get(category)!.push({ clip, stats });
   }
   const clips: any[] = [];
+  const categoryCounts: Record<string, number> = {};
   for (const category of categories) {
-    const candidates = (perCategory.get(category) || []).sort((a, b) => Number(b.viralPotential) - Number(a.viralPotential)).slice(0, 6);
+    const rawCandidates = perCategory.get(category) || [];
+    const candidates = category === "comedy"
+      ? rankComedyCandidates(rawCandidates.flatMap((candidate) => candidate.stats ? [{
+        value: candidate.clip,
+        start: timestampSeconds(candidate.clip.startTime),
+        end: timestampSeconds(candidate.clip.endTime),
+        viralPotential: Number(candidate.clip.viralPotential) || 0,
+        stats: candidate.stats,
+      }] : []), 6).map((candidate) => ({ clip: candidate.value, stats: candidate.stats }))
+      : rawCandidates.sort((a, b) => Number(b.clip.viralPotential) - Number(a.clip.viralPotential)).slice(0, 6);
+    categoryCounts[category] = candidates.length;
     if (candidates.length < 6) warnings.push(`${category}: hanya ${candidates.length} kandidat kuat, tidak diisi clip lemah.`);
-    clips.push(...candidates.map((clip, index) => ({ ...clip, id: `${category}-${index + 1}` })));
+    clips.push(...candidates.map(({ clip }, index) => ({ ...clip, id: `${category}-${index + 1}` })));
   }
-  return { clips, warnings, categoryCounts: Object.fromEntries(categories.map((category) => [category, (perCategory.get(category) || []).length > 6 ? 6 : (perCategory.get(category) || []).length])) };
+  if (comedyRejected > 0) warnings.unshift(`comedy: ${comedyRejected} kandidat dibuang karena tidak memiliki setup dan reaksi tawa yang cukup.`);
+  return { clips, warnings, categoryCounts };
 }
 
 // Upload video file dari browser → simpan ke temp/uploads dan return path absolut
@@ -874,8 +902,11 @@ app.post("/api/slicin/analyze", async (req, res) => {
   try {
     const categoryInstructions = analysisMode === "podcast" ? `
 PODCAST CATEGORIES (return a category on every clip; target up to 6 strong clips per selected category):
-${categories.map((category) => category === "comedy" ? `- comedy: Cari setup, eskalasi, punchline, lalu reaksi. Mulai sebelum punchline, bukan dari baris [tertawa]. Akhiri setelah [tertawa], [berteriak], [bersorak], atau reaksi terdekat. Gunakan payoff jelas. Contoh angle: “gula betes”, “kencing tikus”, rangkaian bantal, “Mamangfron”.` : category === "mystery" ? `- mystery: Cari pertanyaan, hal aneh, mitos, cerita jin/penunggu, atau informasi yang membuat penonton ingin tahu jawabannya. Mulai saat misteri diperkenalkan dan akhiri saat jawaban/reveal. Jangan mengubah mitos menjadi fakta baru.` : `- education: Cari alur mitos/pertanyaan → penjelasan → kesimpulan. Jangan memotong antara pertanyaan dan jawaban. Pertahankan detail agar konteks utuh dan jangan membuat klaim medis/ilmiah baru.`).join("\n")}
+${categories.map((category) => category === "comedy" ? `- comedy (STRICT REACTION-FIRST): Cari momen yang benar-benar dibuat untuk tertawa, dengan urutan setup → eskalasi → punchline → reaksi. Pilih kandidat yang memiliki minimal dua marker reaksi seperti [tertawa], [berteriak], [bersorak], [tepuk tangan], atau [laugh], dan setidaknya satu [tertawa] bila marker itu tersedia di transcript. Utamakan kepadatan reaksi per detik, bukan sekadar topik yang menarik. Mulai satu atau dua baris sebelum setup/punchline, jangan mulai dari baris yang hanya berisi [tertawa]. Akhiri setelah marker reaksi terdekat agar payoff terasa selesai. Tolak segmen informatif, edukatif, sponsor, nasihat, cerita serius, atau obrolan fakta yang tidak punya payoff komedi meskipun topiknya menarik. Marker reaksi adalah bukti bahwa momen itu lucu, bukan isi utama clip. Jangan mengisi enam slot dengan kandidat lemah; lebih baik mengembalikan lebih sedikit clip comedy yang benar-benar lucu.` : category === "mystery" ? `- mystery: Cari pertanyaan, hal aneh, mitos, cerita jin/penunggu, atau informasi yang membuat penonton ingin tahu jawabannya. Mulai saat misteri diperkenalkan dan akhiri saat jawaban/reveal. Jangan mengubah mitos menjadi fakta baru.` : `- education: Cari alur mitos/pertanyaan → penjelasan → kesimpulan. Jangan memotong antara pertanyaan dan jawaban. Pertahankan detail agar konteks utuh dan jangan membuat klaim medis/ilmiah baru.`).join("\n")}
 ` : "";
+    const comedyReactionHint = analysisMode === "podcast" && categories.includes("comedy")
+      ? `\nComedy signal: transcript ini memiliki sekitar ${countComedyReactionMarkers(transcriptLines)} marker tawa/reaksi. Gunakan cluster marker yang rapat sebagai prioritas, tetapi tetap sertakan dialog setup dan punchline.`
+      : "";
     const categoryExample = analysisMode === "podcast" ? `"category":"${categories[0]}",` : "";
     const categoryRules = analysisMode === "podcast" ? `- category wajib salah satu dari: ${categories.join(", ")}` : "";
     const prompt = customPrompt || `
@@ -889,6 +920,7 @@ Task: Identify the strongest short-form segments for Reels/Shorts/TikTok. ${anal
 For gaming: focus on savage/maniac, lord steal, comeback.
 For podcast: preserve the full conversational context, setup, payoff, and reaction. Use transcript timestamp boundaries and do not cut a sentence in half.
 ${categoryInstructions}
+${comedyReactionHint}
 
 Return ONLY a valid JSON array, with double-quoted property names. Do not use Markdown fences, backslashes before property names, comments, or trailing commas:
 [
