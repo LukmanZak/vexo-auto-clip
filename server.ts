@@ -14,6 +14,8 @@ import {
   rankComedyCandidates,
   type ComedyReactionStats,
 } from "./src/lib/comedySelection";
+import { prepareSlicinAnalysis } from "./src/lib/slicinPrompt.ts";
+import { snapClipRangeToTranscript } from "./src/lib/transcriptTiming.ts";
 
 dotenv.config();
 
@@ -94,6 +96,36 @@ function formatDownloadBytes(bytes: number): string {
   return `${(bytes / (1024 ** exponent)).toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
 }
 
+function findExecutableOnPath(command: string): string | null {
+  const pathEntries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? String(process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";").filter(Boolean)
+    : [""];
+  for (const directory of pathEntries) {
+    for (const extension of extensions) {
+      const candidate = path.join(directory, extension ? `${command}${extension}` : command);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Continue searching the remaining PATH entries.
+      }
+    }
+  }
+  return null;
+}
+
+function pythonCommandCandidates(): string[] {
+  const configured = String(process.env.PYTHON_PATH || "").trim();
+  const defaults = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
+  const venvPythonNames = process.platform === "win32"
+    ? ["Scripts\\python.exe", "Scripts\\python"]
+    : ["bin/python3", "bin/python"];
+  const localVenvs = [".venv", "venv"]
+    .flatMap((venv) => venvPythonNames.map((name) => path.join(process.cwd(), venv, name)))
+    .filter((candidate) => fs.existsSync(candidate));
+  return [...new Set([configured, ...localVenvs, ...defaults].filter(Boolean))];
+}
+
 function ytDlpCommand(): { command: string; prefix: string[] } {
   const configured = process.env.YTDLP_PATH;
   if (configured) return { command: configured, prefix: [] };
@@ -112,17 +144,38 @@ function ytDlpCommand(): { command: string; prefix: string[] } {
     // Python user-install directory is optional; fall back to the module command.
   }
   const executable = candidates.find((candidate) => candidate && fs.existsSync(candidate));
-  return executable ? { command: executable, prefix: [] } : { command: process.env.PYTHON_PATH || "python", prefix: ["-m", "yt_dlp"] };
+  const pathExecutable = findExecutableOnPath("yt-dlp");
+  return executable
+    ? { command: executable, prefix: [] }
+    : pathExecutable
+      ? { command: pathExecutable, prefix: [] }
+      : { command: pythonCommandCandidates()[0] || "python", prefix: ["-m", "yt_dlp"] };
 }
 
 function safeFilePart(value: string, fallback: string): string {
   const clean = value
     .normalize("NFKC")
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
-    .replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF]+/g, "_")
+    .replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF_-]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 100);
   return clean || fallback;
+}
+
+function safeTimestampFilePart(value: unknown, fallback: string): string {
+  return safeFilePart(String(value || "").trim().replace(/:/g, "-"), fallback);
+}
+
+function safeClipOutputName(value: unknown, fallback: string): string {
+  const raw = String(value || "").trim();
+  const basename = raw.replace(/\\/g, "/").split("/").pop() || fallback;
+  const clean = basename
+    .normalize("NFKC")
+    .replace(/[^a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 160);
+  if (!clean || clean === ".mp4") return fallback;
+  return /\.mp4$/i.test(clean) ? clean : `${clean}.mp4`;
 }
 
 function cleanCaption(value: string, fallback: string): string {
@@ -149,12 +202,21 @@ function buildSourceAttribution(sourceName: unknown, sourceUrl: unknown): string
   return `\n\nSrc: ${label}${url ? `\nLink: ${url}` : ""}`;
 }
 
-function timestampSeconds(value: string): number {
-  const parts = String(value || "").split(":").map(Number);
-  if (parts.some((part) => !Number.isFinite(part))) return 0;
+function parseClipTimestamp(value: unknown): number {
+  const raw = String(value || "").trim();
+  if (!/^\d{1,2}:\d{2}(?::\d{2})?$/.test(raw)) return Number.NaN;
+  const parts = raw.split(":").map(Number);
+  if (parts.some((part) => !Number.isFinite(part))) return Number.NaN;
+  if (parts.length === 3 && (parts[1] >= 60 || parts[2] >= 60)) return Number.NaN;
+  if (parts.length === 2 && parts[1] >= 60) return Number.NaN;
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
+  return Number.NaN;
+}
+
+function timestampSeconds(value: string): number {
+  const parsed = parseClipTimestamp(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function timestampString(seconds: number): string {
@@ -327,6 +389,64 @@ function normalizeAndLimitPodcastClips(value: unknown, categories: PodcastCatego
   return { clips, warnings, categoryCounts };
 }
 
+function normalizeAnalyzedClip(
+  clip: any,
+  index: number,
+  maxTranscriptTime: number,
+  transcriptBoundaries?: Array<{ start: number; end?: number }>,
+): {
+  id: string;
+  startTime: string;
+  endTime: string;
+  title: string;
+  summary: string;
+  reason: string;
+  transcript_snippet: string;
+  caption: string;
+  viralPotential: number;
+} | null {
+  if (!clip || typeof clip !== "object") return null;
+  const rawStart = parseClipTimestamp(clip.startTime);
+  const rawEnd = parseClipTimestamp(clip.endTime);
+  if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) return null;
+
+  const normalized = normalizeClipTimestamps(clip, maxTranscriptTime);
+  const normalizedStart = parseClipTimestamp(normalized.startTime);
+  const normalizedEnd = parseClipTimestamp(normalized.endTime);
+  if (!Number.isFinite(normalizedStart) || !Number.isFinite(normalizedEnd)) return null;
+
+  const upperBound = Number.isFinite(maxTranscriptTime) ? Math.max(0, maxTranscriptTime) : Number.POSITIVE_INFINITY;
+  let start = Math.min(upperBound, Math.max(0, normalizedStart));
+  let end = Math.min(upperBound, Math.max(0, normalizedEnd));
+  if (transcriptBoundaries) {
+    const snapped = snapClipRangeToTranscript(start, end, transcriptBoundaries, upperBound);
+    if (!snapped) return null;
+    start = snapped.start;
+    end = snapped.end;
+  }
+  if (end <= start) return null;
+
+  const context = typeof clip.context === "string" ? clip.context.trim() : "";
+  const title = String(clip.title || context || `Clip ${index + 1}`).trim();
+  const summary = String(clip.summary || context || "Segmen terpilih dari transcript.").trim();
+  const reason = String(clip.reason || context || "Dipilih sebagai kandidat clip viral.").trim();
+  const transcriptSnippet = String(clip.transcript_snippet || clip.transcriptSnippet || "").trim();
+  const caption = String(clip.caption || "").trim();
+  const score = Number(clip.viralPotential);
+
+  return {
+    id: String(clip.id || `c${index + 1}`).trim() || `c${index + 1}`,
+    startTime: timestampString(start),
+    endTime: timestampString(end),
+    title,
+    summary,
+    reason,
+    transcript_snippet: transcriptSnippet,
+    caption,
+    viralPotential: Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : 0,
+  };
+}
+
 // Upload video file dari browser → simpan ke temp/uploads dan return path absolut
 app.post("/api/upload-video", upload.single("file"), (req, res) => {
   try {
@@ -413,13 +533,13 @@ function subtitleFilterForFile(subtitlePath: string): string {
 
 function parseObsidianLine(md: string) {
   const timestamp = /^\s*(?:[-*]\s*)?(?:\*{0,2})\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?(?:\*{0,2})(?:\s*(?:·|[-–—|])\s*|\s+)(.+?)\s*$/;
-  const parsed = md.split(/\r?\n/).flatMap((rawLine) => {
+  const parsed = md.split(String.fromCharCode(10)).map((rawLine) => rawLine.endsWith(String.fromCharCode(13)) ? rawLine.slice(0, -1) : rawLine).flatMap((rawLine) => {
     const match = rawLine.match(timestamp);
     if (!match) return [];
     const parts = match[1].split(":").map(Number);
     const start = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
-    return [{ start, timeStr: match[1], text: normalizeTranscriptText(match[2].replace(/^\*{1,2}|\*{1,2}$/g, "")) }];
-  });
+    const text = normalizeTranscriptText(match[2].replace(/^\*{1,2}|\*{1,2}$/g, ""));
+    return text ? [{ start, timeStr: match[1], text }] : [];  });
   const merged: typeof parsed = [];
   const indexByStart = new Map<number, number>();
   for (const item of parsed) {
@@ -449,7 +569,7 @@ function extractVideoId(urlOrId: string): string {
 
 async function fetchTranscriptViaPython(videoId: string): Promise<{ start: number; duration: number; text: string }[]> {
   const script = path.join(process.cwd(), "src/python/fetch_transcript.py");
-  const candidates = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
+  const candidates = pythonCommandCandidates();
   let lastErr = "";
 
   for (const exe of candidates) {
@@ -538,7 +658,7 @@ function normalizeFaceTracks(value: unknown): FaceTrackPoint[] {
 
 async function fetchFaceTracksViaPython(videoPath: string, interval: number = 2): Promise<FaceTrackResult> {
   const script = path.join(process.cwd(), "src/python/detect_faces.py");
-  const candidates = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
+  const candidates = pythonCommandCandidates();
   let lastErr = "";
   for (const exe of candidates) {
     try {
@@ -596,10 +716,9 @@ function resolveWhisperModel(modelChoice?: string): { name: WhisperModelChoice; 
 
 async function transcribeClipViaPython(videoPath: string, modelChoice: WhisperModelChoice = "small"): Promise<{ captions: { start: number; end: number; text: string }[]; wordCount: number; model: string; device: string }> {
   const script = path.join(process.cwd(), "src/python/transcribe_clip.py");
-  const candidates = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python", "py"];
+  const candidates = pythonCommandCandidates();
   let lastErr = "";
-  const whisperModel = resolveWhisperModel(modelChoice);
-  for (const exe of candidates) {
+  const whisperModel = resolveWhisperModel(modelChoice);  for (const exe of candidates) {
     try {
       return await new Promise((resolve, reject) => {
         const args = [script, videoPath, "--model", whisperModel.path];
@@ -636,7 +755,7 @@ async function transcribeClipViaPython(videoPath: string, modelChoice: WhisperMo
 // ---------- API: parse obsidian ----------
 app.post("/api/slicin/parse-obsidian", (req, res) => {
   const { markdown } = req.body;
-  if (!markdown) return res.status(400).json({ error: "Missing markdown" });
+  if (typeof markdown !== "string" || !markdown.trim()) return res.status(400).json({ error: "Missing markdown" });
   try {
     const lines = parseObsidianLine(markdown);
     res.json({ lines, count: lines.length });
@@ -870,7 +989,7 @@ app.get("/api/youtube/download-progress/:jobId", (req, res) => {
 // ---------- API: analyze transcript -> clips via Gemini 3.5 flash lite ----------
 app.post("/api/slicin/analyze", async (req, res) => {
   const { transcript, videoPath, mode, customPrompt, apiKey } = req.body;
-  const analysisMode = mode === "gaming" ? "gaming" : "podcast";
+  const analysisMode = mode === "gaming" || mode === "comedy" || mode === "educate" ? mode : "podcast";
   const categories = normalizePodcastCategories(req.body.categories, analysisMode);
   const transcriptLines = Array.isArray(transcript)
     ? transcriptLinesFromInput(transcript)
@@ -889,7 +1008,7 @@ app.post("/api/slicin/analyze", async (req, res) => {
   } else if (typeof transcript === "string") {
     plain = normalizeTranscriptText(transcript).replace(/\\+([\[\]])/g, "$1");
   }
-  if (!plain) return res.status(400).json({ error: "Missing transcript" });
+  if (!plain.trim()) return res.status(400).json({ error: "Missing transcript" });
 
   if (analysisMode === "podcast" && !categories.length) {
     return res.status(400).json({ error: "Pilih minimal satu kategori podcast: Comedy, Mystery, atau Edukasi." });
@@ -898,7 +1017,7 @@ app.post("/api/slicin/analyze", async (req, res) => {
   // limit transcript to avoid token overflow (approx 30k chars)
   if (plain.length > 30000) plain = plain.slice(0, 30000) + "\n...[truncated]";
 
-  const fileName = videoPath ? path.basename(videoPath) : "youtube-video";
+  const fileName = typeof videoPath === "string" && videoPath.trim() ? path.basename(videoPath) : "youtube-video";
   try {
     const categoryInstructions = analysisMode === "podcast" ? `
 PODCAST CATEGORIES (return a category on every clip; target up to 6 strong clips per selected category):
@@ -909,7 +1028,7 @@ ${categories.map((category) => category === "comedy" ? `- comedy (STRICT REACTIO
       : "";
     const categoryExample = analysisMode === "podcast" ? `"category":"${categories[0]}",` : "";
     const categoryRules = analysisMode === "podcast" ? `- category wajib salah satu dari: ${categories.join(", ")}` : "";
-    const prompt = customPrompt || `
+    let prompt: string = customPrompt || `
 You are an expert viral short-form editor for ${analysisMode === "gaming" ? "Gaming (MOBA HOK/MLBB)" : "Indonesian Podcast (Helmy Yahya style)"}.
 Video: "${fileName}"
 
@@ -946,35 +1065,66 @@ ${categoryRules}
 - JSON wajib valid dan parsable dengan JSON.parse. Escape newline di dalam string sebagai \\n, dan jangan menyalin escape Markdown seperti \\[musik\\] ke output JSON.
 `;
 
-    const client = apiKey ? new GoogleGenAI({ apiKey }) : genAI;
-
+    const client = typeof apiKey === "string" && apiKey.trim() ? new GoogleGenAI({ apiKey }) : genAI;
+    if (analysisMode !== "podcast") {
+      const prepared = await prepareSlicinAnalysis({
+        mode: analysisMode,
+        fileName,
+        transcript: plain,
+        customPrompt,
+        generateCorrection: async (correctionPrompt) => {
+          const correctionResponse: any = await client.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: correctionPrompt,
+            config: { responseMimeType: "application/json", temperature: 0.1 },
+          } as any);
+          return correctionResponse.text || correctionResponse.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        },
+      });
+      prompt = prepared.prompt;
+    }
     // helper: robust JSON array extraction
     function extractJsonArray(raw: string): string | null {
       let t = raw.trim();
       // strip ```json fences if present
       const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
       if (fence) t = fence[1].trim();
-      const start = t.indexOf("[");
-      if (start < 0) return null;
-      let depth = 0;
-      let inString = false;
-      let escaped = false;
-      for (let index = start; index < t.length; index += 1) {
-        const char = t[index];
-        if (inString) {
-          if (escaped) escaped = false;
-          else if (char === "\\") escaped = true;
-          else if (char === '"') inString = false;
-          continue;
-        }
-        if (char === '"') inString = true;
-        else if (char === "[") depth += 1;
-        else if (char === "]") {
-          depth -= 1;
-          if (depth === 0) return t.slice(start, index + 1);
+      const candidates: { opener: "[" | "{"; value: string }[] = [];
+      for (let start = 0; start < t.length; start += 1) {
+        const opener = t[start];
+        if (opener !== "[" && opener !== "{") continue;
+        const stack: string[] = [];
+        let inString = false;
+        let escaped = false;
+        for (let index = start; index < t.length; index += 1) {
+          const char = t[index];
+          if (inString) {
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') inString = false;
+            continue;
+          }
+          if (char === '"') {
+            inString = true;
+          } else if (char === "[" || char === "{") {
+            stack.push(char);
+          } else if (char === "]" || char === "}") {
+            const expected = char === "]" ? "[" : "{";
+            if (stack.at(-1) !== expected) break;
+            stack.pop();
+            if (!stack.length) {
+              candidates.push({ opener, value: t.slice(start, index + 1) });
+              break;
+            }
+          }
         }
       }
-      return null;
+      const arrays = candidates.filter((candidate) => candidate.opener === "[");
+      const likelyArray = arrays.find((candidate) => {
+        const firstValue = candidate.value.slice(1, -1).trim();
+        return firstValue.startsWith("{") || firstValue.startsWith("[");
+      });
+      return (likelyArray || arrays[0] || candidates.find((candidate) => candidate.opener === "{"))?.value || null;
     }
 
     function repairJsonSyntax(source: string): string {
@@ -1065,17 +1215,32 @@ ${categoryRules}
     };
     const readText = (response: any) => response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const generate = async (contents: string) => {
-      try {
-        return readText(await client.models.generateContent({ model: GEMINI_MODEL, contents, config: structuredConfig } as any));
-      } catch (schemaError: any) {
-        console.warn("Structured JSON response failed, retrying JSON mime type:", schemaError.message?.slice(0, 240));
+      let lastError: any;
+      const attempts = [
+        {
+          label: "Structured JSON response",
+          request: () => client.models.generateContent({ model: GEMINI_MODEL, contents, config: structuredConfig } as any),
+        },
+        {
+          label: "JSON mime type",
+          request: () => client.models.generateContent({ model: GEMINI_MODEL, contents, config: { responseMimeType: "application/json", temperature: 0.2 } } as any),
+        },
+        {
+          label: "Plain response",
+          request: () => client.models.generateContent({ model: GEMINI_MODEL, contents }),
+        },
+      ];
+      for (const attempt of attempts) {
         try {
-          return readText(await client.models.generateContent({ model: GEMINI_MODEL, contents, config: { responseMimeType: "application/json", temperature: 0.2 } } as any));
-        } catch (mimeError: any) {
-          console.warn("JSON mime type failed, retrying plain response:", mimeError.message?.slice(0, 240));
-          return readText(await client.models.generateContent({ model: GEMINI_MODEL, contents }));
+          const text = readText(await attempt.request());
+          if (text.trim()) return text;
+          lastError = new Error(`${attempt.label} returned an empty response`);
+        } catch (error: any) {
+          lastError = error;
+          if (attempt !== attempts.at(-1)) console.warn(`${attempt.label} failed, retrying fallback:`, error.message?.slice(0, 240));
         }
       }
+      throw lastError || new Error("AI returned empty response");
     };
 
     let text = await generate(prompt);
@@ -1117,12 +1282,14 @@ ${categoryRules}
       const limited = normalizeAndLimitPodcastClips(clips, categories, transcriptLines, maxTranscriptTime);
       res.json({ clips: limited.clips, model: GEMINI_MODEL, categories, targetPerCategory: 6, categoryCounts: limited.categoryCounts, warnings: limited.warnings });
     } else {
+      const transcriptBoundaries = analysisMode === "educate" ? transcriptLines : undefined;
       clips = clips
-        .filter((clip: any) => clip && clip.startTime && clip.endTime)
-        .map((clip: any) => normalizeClipTimestamps(clip, maxTranscriptTime));
+        .map((clip: any, index: number) => normalizeAnalyzedClip(clip, index, maxTranscriptTime, transcriptBoundaries))
+        .filter((clip: any): clip is NonNullable<typeof clip> => clip !== null)
+        .slice(0, 7);
+      if (!clips.length) throw new Error("AI tidak mengembalikan clip dengan timestamp yang valid");
       res.json({ clips, model: GEMINI_MODEL });
-    }
-  } catch (e: any) {
+    }  } catch (e: any) {
     console.error("Gemini error", e);
     res.status(500).json({ error: e.message, model: GEMINI_MODEL, hint: "Analyze sekarang memakai JSON schema, repair escape ilegal, dan retry otomatis. Jika tetap gagal, cek model/API key atau kurangi panjang transcript." });
   }
@@ -1131,17 +1298,23 @@ ${categoryRules}
 // ---------- Legacy: /api/slicin/process (now uses real transcript if provided) ----------
 app.post("/api/slicin/process", async (req, res) => {
   const { videoPath, mode, transcript } = req.body;
-  // forward to /analyze
-  if (transcript) {
+  if ((typeof transcript === "string" && transcript.trim()) || (Array.isArray(transcript) && transcript.length > 0)) {
     // if transcript provided directly
-    const mockReq = { body: { transcript, videoPath, mode } } as any;
-    // reuse logic
     let plain = Array.isArray(transcript)
-      ? transcript.map((l: any) => `[${l.timeStr || ""}] ${l.text}`).join("\n")
+      ? transcript.flatMap((l: any) => {
+        const text = typeof l?.text === "string" ? l.text.trim() : "";
+        if (!text) return [];
+        return [`[${String(l?.timeStr || "").trim()}] ${text}`];
+      }).join("\n")
       : transcript;
+    if (!plain.trim()) {
+      return res.status(400).json({ error: "Provide transcript (obsidian markdown or lines). Use /api/slicin/parse-obsidian + /api/slicin/analyze" });
+    }
     if (plain.length > 30000) plain = plain.slice(0, 30000);
     try {
-      const prompt = `You are viral editor for ${mode}. Transcript:\n${plain}\nReturn ONLY valid JSON array, no markdown, no extra text: [{"id":"c1","startTime":"00:01:20","endTime":"00:01:55","context":"reason","viralPotential":90}]`;
+      const processMode = String(mode || "podcast").trim() || "podcast";
+      const processVideo = typeof videoPath === "string" && videoPath.trim() ? path.basename(videoPath) : "youtube-video";
+      const prompt = `You are viral editor for ${processMode}.\nVideo: "${processVideo}"\nTranscript:\n${plain}\nReturn ONLY valid JSON array, no markdown, no extra text: [{"id":"c1","startTime":"00:01:20","endTime":"00:01:55","context":"reason","viralPotential":90}]`;
       let text = "";
       try {
         const r: any = await genAI.models.generateContent({ model: GEMINI_MODEL, contents: prompt, config: { responseMimeType: "application/json" } as any });
@@ -1169,7 +1342,9 @@ app.post("/api/slicin/process", async (req, res) => {
 // ---------- Thumbnails ----------
 app.post("/api/slicin/thumbnail", async (req, res) => {
   const { videoPath, time } = req.body;
-  if (!videoPath || time === undefined) return res.status(400).json({ error: "Missing videoPath/time" });
+  if (typeof videoPath !== "string" || !videoPath.trim() || (typeof time !== "number" && typeof time !== "string") || !String(time).trim() || !Number.isFinite(Number(time))) {
+    return res.status(400).json({ error: "Missing videoPath/time" });
+  }
   const out = path.join(THUMB_DIR, `thumb_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
   try {
     const ffmpegPath = process.env.FFMPEG_PATH || "";
@@ -1342,31 +1517,34 @@ function buildXExpr(tracks: FaceTrackPoint[], sSec: number, eSec: number): strin
 app.post("/api/slicin/cut", async (req, res) => {
   const { videoPath, startTime, endTime, outputName, aspectRatio, smartCrop, faceTracks, sampleInterval, version, title, caption, subtitleLines, burnCaptions, captionEngine, whisperModel, sourceName, sourceUrl } = req.body;
   const ffmpegPath = process.env.FFMPEG_PATH || "";
-  if (!videoPath || !startTime || !endTime) return res.status(400).json({ error: "Missing required parameters" });
-  const ver = Number(version) || 3; // 1=hijau, 2=hijau+posisi, 3=bersih per-frame
+  if (typeof videoPath !== "string" || !videoPath.trim() || typeof startTime !== "string" || !startTime.trim() || typeof endTime !== "string" || !endTime.trim()) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+  const renderAspect = ["9:16", "1:1", "4:5", "original"].includes(String(aspectRatio)) ? String(aspectRatio) : "original";
+  const requestedVersion = Number(version);
+  const ver = requestedVersion === 1 || requestedVersion === 2 || requestedVersion === 3 ? requestedVersion : 3; // 1=hijau, 2=hijau+posisi, 3=bersih per-frame
+  const smartCropEnabled = smartCrop === true;
   // resolve ke absolute yang ada di disk
   const resolvedVideoPath = resolveVideoPath(videoPath);
   if (!fs.existsSync(resolvedVideoPath)) {
     return res.status(400).json({ error: `Video file not found on server: ${videoPath}. Upload dulu via Pilih File atau Fetch YouTube. Tried: ${resolvedVideoPath}`, hint: "Di Step 1 klik Pilih File → file akan otomatis upload ke temp/uploads" });
   }
   let subtitlePath: string | null = null;
+  let segDir: string | null = null;
   try {
     // Selalu simpan di CLIP_DIR biar tidak tabrakan dan otomatis bisa diakses via /temp/clips, nama sudah include timestamp+time+segmen dari frontend
-    let outputPath = path.join(CLIP_DIR, outputName || `cut_${Date.now()}.mp4`);
-    const captionTitle = String(title || "Context Slicer").trim();
-    const fallbackCaption = `Di bagian ini, ${captionTitle.toLowerCase()} dibahas dari ${startTime} sampai ${endTime}.`;
+    const outputFileName = safeClipOutputName(outputName, `cut_${Date.now()}.mp4`);
+    let outputPath = path.join(CLIP_DIR, outputFileName);
+    const captionTitle = String(title || "Context Slicer").trim() || "Context Slicer";
+    const displayTitle = cleanCaption(captionTitle, "Context Slicer");
+    const fallbackCaption = `Di bagian ini, ${displayTitle.toLowerCase()} dibahas dari ${startTime} sampai ${endTime}.`;
     const finalCaption = `${cleanCaption(caption, fallbackCaption)}${buildSourceAttribution(sourceName, sourceUrl)}`;
-    const captionFile = `${safeFilePart(captionTitle, "clip")}_${safeFilePart(startTime, "00-00")}.md`;
+    const captionFile = `${safeFilePart(displayTitle, "clip")}_${safeTimestampFilePart(startTime, "00-00")}.md`;
     const captionPath = path.join(CLIP_DIR, captionFile);
     const saveCaption = () => {
-      fs.writeFileSync(captionPath, `# ${cleanCaption(captionTitle, "Context Slicer")}\n\nWaktu: ${startTime} sampai ${endTime}\n\n${finalCaption}\n`);
+      fs.writeFileSync(captionPath, `# ${displayTitle}\n\nWaktu: ${startTime} sampai ${endTime}\n\n${finalCaption}\n`);
     };
-    const toSec = (t: string) => {
-      const p = t.split(":").map(Number);
-      if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
-      if (p.length === 2) return p[0] * 60 + p[1];
-      return Number(t) || 0;
-    };
+    const toSec = (t: string) => parseClipTimestamp(t);
     const sSec = toSec(startTime);
     const eSec = toSec(endTime);
     const duration = eSec - sSec;
@@ -1411,6 +1589,21 @@ app.post("/api/slicin/cut", async (req, res) => {
       try { fs.rmSync(outputPath, { force: true }); } catch {}
       return captionedPath;
     };
+    const finalizeSubtitleOutput = async () => {
+      if (!subtitlePath || useWhisperCaptions) return;
+      const subtitledPath = outputPath.replace(/\.mp4$/i, "_captioned.mp4");
+      await runFfmpegCommand(ffmpegPath, [
+        "-i", outputPath,
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", `${subtitleFilterForFile(subtitlePath)},setpts=PTS-STARTPTS`,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+        "-movflags", "+faststart", "-y", subtitledPath,
+      ]);
+      assertValidVideoOutput(subtitledPath);
+      try { fs.rmSync(outputPath, { force: true }); } catch {}
+      outputPath = subtitledPath;
+    };
 
     // helper: interpolate x,y,width at time t
     const interp = (t: number) => {
@@ -1432,9 +1625,9 @@ app.post("/api/slicin/cut", async (req, res) => {
     const vfFor = (x: number, version: number = 3, segMid: number = 0, y: number = 0.5, width: number = 0.18, height: number = 0.24) => {
       const xf = Math.max(0, Math.min(1, x)).toFixed(3);
       let base = "";
-      if (aspectRatio === "9:16") base = `crop=ih*9/16:ih:(in_w-ih*9/16)*${xf}:0,scale=720:1280:flags=lanczos`;
-      else if (aspectRatio === "1:1") base = `crop=ih:ih:(in_w-ih)*${xf}:0,scale=720:720:flags=lanczos`;
-      else if (aspectRatio === "4:5") base = `crop=ih*4/5:ih:(in_w-ih*4/5)*${xf}:0,scale=720:900:flags=lanczos`;
+      if (renderAspect === "9:16") base = `crop=ih*9/16:ih:(in_w-ih*9/16)*${xf}:0,scale=720:1280:flags=lanczos`;
+      else if (renderAspect === "1:1") base = `crop=ih:ih:(in_w-ih)*${xf}:0,scale=720:720:flags=lanczos`;
+      else if (renderAspect === "4:5") base = `crop=ih*4/5:ih:(in_w-ih*4/5)*${xf}:0,scale=720:900:flags=lanczos`;
       else return "scale=1280:720:flags=lanczos";
       const bw = Math.max(0.08, Math.min(0.55, (width || 0.18) * 2.8));
       const bh = Math.max(0.08, Math.min(0.8, (height || 0.24) * 2.8));
@@ -1452,7 +1645,7 @@ app.post("/api/slicin/cut", async (req, res) => {
     };
 
     // Decide mode: dynamic segmented if smartCrop + enough tracks + duration > interval
-    const useDynamic = !!smartCrop && preparedFaceTracks.length >= 2 && aspectRatio !== "original" && aspectRatio !== "16:9" && duration > interval;
+    const useDynamic = smartCropEnabled && preparedFaceTracks.length >= 2 && renderAspect !== "original" && renderAspect !== "16:9" && duration > interval;
 
     if (!useDynamic) {
       // fallback: single static crop (average or centered) — bbox mengikuti wajah
@@ -1461,24 +1654,26 @@ app.post("/api/slicin/cut", async (req, res) => {
         if (!arr.length) return { x: 0.5, y: 0.5, w: 0.18, h: 0.24 };
         return { x: arr.reduce((a,b)=>a+b.x,0)/arr.length, y: arr.reduce((a,b)=>a+(b.y||0.5),0)/arr.length, w: arr.reduce((a,b)=>a+(b.width||0.18),0)/arr.length, h: arr.reduce((a,b)=>a+(b.height||0.24),0)/arr.length };
       };
-      if (aspectRatio === "9:16") {
-        if (smartCrop && preparedFaceTracks.length > 0) {
+      if (renderAspect === "9:16") {
+        if (smartCropEnabled && preparedFaceTracks.length > 0) {
           const relevant = preparedFaceTracks.filter((f) => f.time >= sSec && f.time <= eSec);
           const {x,y,w} = avg(relevant);
           vf = vfFor(x, ver, (sSec + eSec) / 2, y, w, avg(relevant).h);
         } else vf = vfFor(0.5, ver, (sSec + eSec) / 2, 0.45, 0.18);
-      } else if (aspectRatio === "1:1") {
-        if (smartCrop && preparedFaceTracks.length) {
+      } else if (renderAspect === "1:1") {
+        if (smartCropEnabled && preparedFaceTracks.length) {
           const relevant = preparedFaceTracks.filter((f) => f.time >= sSec && f.time <= eSec);
           const {x,y,w} = avg(relevant);
           vf = vfFor(x, ver, (sSec + eSec) / 2, y, w, avg(relevant).h);
         } else vf = vfFor(0.5, ver, (sSec + eSec) / 2, 0.45, 0.18);
-      } else if (aspectRatio === "4:5") {
-        if (smartCrop && preparedFaceTracks.length) {
+      } else if (renderAspect === "4:5") {
+        if (smartCropEnabled && preparedFaceTracks.length) {
           const relevant = preparedFaceTracks.filter((f) => f.time >= sSec && f.time <= eSec);
           const {x,y,w} = avg(relevant);
           vf = vfFor(x, ver, (sSec + eSec) / 2, y, w, avg(relevant).h);
         } else vf = vfFor(0.5, ver, (sSec + eSec) / 2, 0.45, 0.18);
+      } else {
+        vf = vfFor(0.5, ver, (sSec + eSec) / 2, 0.5, 0.18, 0.24);
       }
       vf = addSubtitleFilter(vf);
       const normalizedVf = `${vf || "null"},setpts=PTS-STARTPTS`;
@@ -1490,7 +1685,7 @@ app.post("/api/slicin/cut", async (req, res) => {
       assertValidVideoOutput(outputPath);
       outputPath = await finalizeCaptionedOutput();
       saveCaption();
-      res.json({ success: true, outputPath, captionPath, caption: finalCaption, aspectRatio, smartCrop: !!smartCrop, mode: "static" });
+      res.json({ success: true, outputPath, outputUrl: publicTempUrl(outputPath), captionPath, captionUrl: publicTempUrl(captionPath), caption: finalCaption, aspectRatio: renderAspect, smartCrop: smartCropEnabled, mode: "static", interval, version: ver, xExprLen: 0 });
       return;
     }
 
@@ -1500,9 +1695,9 @@ app.post("/api/slicin/cut", async (req, res) => {
         const xExpr = buildXExpr(preparedFaceTracks, sSec, eSec);
         if (xExpr && xExpr.length < 8000) {
           let basePerFrame = "";
-          if (aspectRatio === "9:16") basePerFrame = `crop=ih*9/16:ih:(in_w-ih*9/16)*(${xExpr}):0,scale=720:1280:flags=lanczos`;
-          else if (aspectRatio === "1:1") basePerFrame = `crop=ih:ih:(in_w-ih)*(${xExpr}):0,scale=720:720:flags=lanczos`;
-          else if (aspectRatio === "4:5") basePerFrame = `crop=ih*4/5:ih:(in_w-ih*4/5)*(${xExpr}):0,scale=720:900:flags=lanczos`;
+          if (renderAspect === "9:16") basePerFrame = `crop=ih*9/16:ih:(in_w-ih*9/16)*(${xExpr}):0,scale=720:1280:flags=lanczos`;
+          else if (renderAspect === "1:1") basePerFrame = `crop=ih:ih:(in_w-ih)*(${xExpr}):0,scale=720:720:flags=lanczos`;
+          else if (renderAspect === "4:5") basePerFrame = `crop=ih*4/5:ih:(in_w-ih*4/5)*(${xExpr}):0,scale=720:900:flags=lanczos`;
           else basePerFrame = "scale=1280:720:flags=lanczos";
           let vfPerFrame = basePerFrame;
           if (ver === 1) {
@@ -1531,7 +1726,7 @@ app.post("/api/slicin/cut", async (req, res) => {
           assertValidVideoOutput(outputPath);
           outputPath = await finalizeCaptionedOutput();
           saveCaption();
-          res.json({ success: true, outputPath, captionPath, caption: finalCaption, aspectRatio, smartCrop: true, mode: "per-frame-smooth", interval, version: ver, xExprLen: xExpr.length });
+          res.json({ success: true, outputPath, outputUrl: publicTempUrl(outputPath), captionPath, captionUrl: publicTempUrl(captionPath), caption: finalCaption, aspectRatio: renderAspect, smartCrop: true, mode: "per-frame-smooth", interval, version: ver, xExprLen: xExpr.length });
           return;
         }
       } catch (e:any) {
@@ -1540,7 +1735,7 @@ app.post("/api/slicin/cut", async (req, res) => {
     }
 
     // Fallback Dynamic: cut per interval then concat (segmented)
-    const segDir = path.join(CLIP_DIR, `_seg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+    segDir = path.join(CLIP_DIR, `_seg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
     fs.mkdirSync(segDir, { recursive: true });
     const toTime = (sec: number) => {
       const h = Math.floor(sec / 3600); const m = Math.floor((sec % 3600) / 60); const s = sec % 60;
@@ -1554,7 +1749,7 @@ app.post("/api/slicin/cut", async (req, res) => {
       const segEnd = Math.min(cur + interval, eSec);
       const mid = (segStart + segEnd) / 2;
       const { x, y, width, height } = interp(mid);
-      const vf = `${addSubtitleFilter(vfFor(x, ver, mid, y, width, height))},setpts=PTS-STARTPTS`;
+      const vf = `${vfFor(x, ver, mid, y, width, height)},setpts=PTS-STARTPTS`;
       const segPath = path.join(segDir, `seg_${String(idx).padStart(3, "0")}.mp4`);
       const args: string[] = [];
       args.push("-i", resolvedVideoPath, "-ss", toTime(segStart), "-t", String(Math.max(0.1, segEnd - segStart)), "-map", "0:v:0", "-map", "0:a:0?");
@@ -1564,7 +1759,7 @@ app.post("/api/slicin/cut", async (req, res) => {
         await runFfmpegCommand(ffmpegPath, args);
       } catch (err: any) {
         if (ver === 2 && String(err.message).toLowerCase().includes("drawtext")) {
-          const vf1 = `${addSubtitleFilter(vfFor(x, 1, mid, y, width, height))},setpts=PTS-STARTPTS`;
+          const vf1 = `${vfFor(x, 1, mid, y, width, height)},setpts=PTS-STARTPTS`;
           const args1 = ["-i", resolvedVideoPath, "-ss", toTime(segStart), "-t", String(Math.max(0.1, segEnd - segStart)), "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf1, "-c:a", "aac", "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS", "-movflags", "+faststart", "-y", segPath];
           await runFfmpegCommand(ffmpegPath, args1);
         } else throw err;
@@ -1578,17 +1773,21 @@ app.post("/api/slicin/cut", async (req, res) => {
     // Try concat with re-encode (robust for differing timestamps)
     await runFfmpegCommand(ffmpegPath, ["-f", "concat", "-safe", "0", "-i", listPath, "-map", "0:v:0", "-map", "0:a:0?", "-vf", "setpts=PTS-STARTPTS", "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS", "-movflags", "+faststart", "-y", outputPath]);
     assertValidVideoOutput(outputPath);
+    await finalizeSubtitleOutput();
     outputPath = await finalizeCaptionedOutput();
     // cleanup
     try { fs.rmSync(segDir, { recursive: true, force: true }); } catch {}
     saveCaption();
-    res.json({ success: true, outputPath, captionPath, caption: finalCaption, aspectRatio, smartCrop: true, mode: "dynamic", segments: segFiles.length, interval, version: ver });
+    res.json({ success: true, outputPath, outputUrl: publicTempUrl(outputPath), captionPath, captionUrl: publicTempUrl(captionPath), caption: finalCaption, aspectRatio: renderAspect, smartCrop: true, mode: "dynamic", segments: segFiles.length, interval, version: ver, xExprLen: 0 });
   } catch (e: any) {
     const hint = subtitlePath && /No such filter: '?(subtitles|ass)|libass/i.test(String(e.message))
       ? "FFmpeg di komputer ini belum memiliki filter subtitles/libass. Instal full build FFmpeg yang menyertakan libass."
       : undefined;
     res.status(500).json({ error: e.message, hint });
   } finally {
+    if (segDir) {
+      try { fs.rmSync(segDir, { recursive: true, force: true }); } catch {}
+    }
     if (subtitlePath) {
       try { fs.rmSync(subtitlePath, { force: true }); } catch {}
     }

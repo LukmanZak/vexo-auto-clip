@@ -4,12 +4,19 @@ Dokumen ini menjelaskan dependency dan file model yang diperlukan untuk menjalan
 
 ## 1. Prasyarat sistem
 
-Install dan pastikan semuanya tersedia di `PATH`:
+Install dan pastikan semuanya tersedia di `PATH`. Untuk hasil paling konsisten, gunakan virtual environment project `.venv` atau `venv`; server akan memprioritaskan Python dari virtual environment tersebut.
 
 - Node.js LTS dan npm
 - Python 3.11–3.13
 - FFmpeg (harus menyediakan `ffmpeg` dan `ffprobe`)
 - Git, jika project diambil dari repository
+
+Contoh membuat dan mengaktifkan virtual environment di Windows:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
 Verifikasi dari PowerShell:
 
@@ -59,37 +66,31 @@ python -m pip install opencv-python mediapipe
 python -m pip install --upgrade yt-dlp
 ```
 
-Server akan mencoba executable `yt-dlp` terlebih dahulu, lalu fallback ke `python -m yt_dlp`.
+Server akan mencoba executable `yt-dlp` terlebih dahulu, lalu fallback ke `python -m yt_dlp`. Python dari `.venv`/`venv` project akan dipakai lebih dulu; bila memakai instalasi Python lain, isi `PYTHON_PATH` di `.env` secara eksplisit.
 
 ## 4. Model yang diperlukan
 
 ### Face tracking
 
-File berikut sudah ada di repository dan tidak perlu di-install ulang:
+File model face tracking yang dipakai project:
 
+- `public/face_landmarker.task` (browser)
 - `public/src/model/face_landmarker.task`
 - `src/model/blaze_face_short_range.tflite`
 - `public/src/model/blaze_face_short_range.tflite`
 
-Python tracker memprioritaskan MediaPipe Tasks/BlazeFace dan memiliki fallback bila salah satu API tidak tersedia.
+`src/model/blaze_face_short_range.tflite` adalah lokasi utama Python tracker. Salinan di `public/src/model/` menjadi fallback bila lokasi utama tidak ada. Python tracker memprioritaskan BlazeFace TFLite, lalu MediaPipe Solutions, MediaPipe Tasks, dan Haar cascade.
 
-### Whisper Small
+### Whisper Small dan Medium
 
-Caption otomatis sekarang memakai **faster-whisper Small**, bukan Medium. Konfigurasi default ada di `.env`:
-
-```env
-WHISPER_MODEL=small
-```
-
-Aplikasi akan memprioritaskan folder lokal berikut:
+Pilih model **Small** atau **Medium** pada opsi caption di halaman Export. Siapkan folder lokal yang sesuai:
 
 ```text
 models/faster-whisper-small/
+models/faster-whisper-medium/
 ```
 
-Folder tersebut berisi `config.json`, `model.bin`, `tokenizer.json`, dan `vocabulary.txt`. Model lokal tidak masuk Git karena ukurannya besar. Pada project ini model Small sudah disiapkan secara lokal (sekitar 483 MB).
-
-Jika setup di komputer baru, download sekali dengan Python:
+Folder tersebut berisi `config.json`, `model.bin`, dan `tokenizer.json`. Model lokal tidak masuk Git karena ukurannya besar, sehingga folder ini tidak dijamin ikut ketika project di-clone. Jika belum ada, download model yang dipilih sekali dengan Python:
 
 ```powershell
 python -c "from faster_whisper.utils import download_model; print(download_model('small', output_dir='models/faster-whisper-small'))"
@@ -104,7 +105,6 @@ Buat atau edit `.env` di root project. Jangan commit API key ke Git.
 ```env
 GEMINI_API_KEY=isi_api_key_gemini
 PORT=3333
-WHISPER_MODEL=small
 MAX_UPLOAD_GB=4
 ```
 
@@ -112,7 +112,6 @@ Keterangan:
 
 - `GEMINI_API_KEY`: diperlukan untuk Analyze transcript.
 - `PORT`: default `3333`.
-- `WHISPER_MODEL`: default `small`; bila diisi path model, path tersebut dipakai.
 - `MAX_UPLOAD_GB`: batas upload file lokal dari browser, default 4 GB.
 
 Setelah mengubah `.env`, restart `npm run dev`.
@@ -132,6 +131,8 @@ npm run lint
 npm run build
 python -m unittest src/python/test_transcribe_clip.py
 ```
+
+Jika memakai virtual environment, jalankan perintah Python dengan environment tersebut aktif. Server juga otomatis mencarinya di `.venv` lalu `venv`; gunakan `PYTHON_PATH` bila ingin memilih interpreter tertentu.
 
 Untuk memastikan model Whisper bisa dipakai, jalankan pada video pendek:
 
